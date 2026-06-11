@@ -26,7 +26,7 @@ pub struct ConfigPayload {
     pub memo: String,
     pub version_no: String,
 }
-
+// add new field called tag, which shows the most recent version
 #[derive(Deserialize)]
 pub struct PaginationParams {
     #[serde(default = "default_page")]
