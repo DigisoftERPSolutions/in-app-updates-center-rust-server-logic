@@ -1,0 +1,11 @@
+2026-06-04T15:07:49.177162Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-04T15:07:49.177716Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-04T15:07:51.192692Z  WARN ThreadId(01) sqlx::pool::acquire: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:302: acquired connection, but time to acquire exceeded slow threshold aquired_after_secs=2.01476794 slow_acquire_threshold_secs=2.0
+2026-06-04T15:07:51.193687Z  INFO ThreadId(01) logic: src/main.rs:53: Server listening on 0.0.0.0:8000
+2026-06-04T15:10:38.483777Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-04T15:10:38.484295Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-04T15:10:39.889267Z  INFO ThreadId(01) logic: src/main.rs:53: Server listening on 0.0.0.0:8000
+2026-06-04T15:10:46.544174Z  WARN ThreadId(05) logic::authentication::login: src/authentication/login.rs:89: JWT_SECRET not set — using insecure fallback
+2026-06-04T18:32:09.148709Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-04T18:32:09.156026Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-04T18:32:10.950247Z  INFO ThreadId(01) logic: src/main.rs:53: Server listening on 0.0.0.0:8000

@@ -1,0 +1,6 @@
+2026-06-11T06:34:53.298618Z  INFO ThreadId(01) logic: src/main.rs:25: Starting Backup service
+2026-06-11T06:34:53.299244Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-11T06:34:56.441837Z  WARN ThreadId(01) sqlx::pool::acquire: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:302: acquired connection, but time to acquire exceeded slow threshold aquired_after_secs=3.142342743 slow_acquire_threshold_secs=2.0
+2026-06-11T06:34:56.443018Z  INFO ThreadId(01) logic: src/main.rs:53: Server listening on 0.0.0.0:8000
+2026-06-11T06:36:43.858101Z ERROR ThreadId(12) logic::configuration::operations: src/configuration/operations.rs:154: DB insert failed: error returned from database: relation "releases" does not exist
+2026-06-11T06:36:43.858322Z ERROR ThreadId(12) tower_http::trace::on_failure: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-http-0.6.11/src/trace/on_failure.rs:93: response failed classification=Status code: 500 Internal Server Error latency=571 ms

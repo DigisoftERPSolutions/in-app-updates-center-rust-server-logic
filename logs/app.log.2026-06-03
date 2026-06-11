@@ -1,0 +1,32 @@
+2026-06-03T09:05:53.142030Z  INFO ThreadId(01) logic: src/main.rs:22: Starting VSCU middleware service
+2026-06-03T09:07:21.272519Z  INFO ThreadId(01) logic: src/main.rs:22: Starting VSCU middleware service
+2026-06-03T09:10:35.554299Z  INFO ThreadId(01) logic: src/main.rs:22: Starting VSCU middleware service
+2026-06-03T09:11:47.290053Z  INFO ThreadId(01) logic: src/main.rs:22: Starting Backup service
+2026-06-03T09:18:35.397998Z  INFO ThreadId(01) logic: src/main.rs:22: Starting Backup service
+2026-06-03T10:16:32.034900Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-03T10:17:59.258856Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-03T10:17:59.259198Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-03T10:18:01.707260Z  WARN ThreadId(01) sqlx::pool::acquire: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:302: acquired connection, but time to acquire exceeded slow threshold aquired_after_secs=2.447909913 slow_acquire_threshold_secs=2.0
+2026-06-03T10:19:36.781239Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-03T10:19:36.781591Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-03T10:19:38.556752Z  INFO ThreadId(01) logic: src/main.rs:51: Server listening on 0.0.0.0:8000
+2026-06-03T10:23:56.877097Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-03T10:23:56.877467Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-03T10:24:03.263274Z  WARN ThreadId(01) sqlx::pool::acquire: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:302: acquired connection, but time to acquire exceeded slow threshold aquired_after_secs=6.38565398 slow_acquire_threshold_secs=2.0
+2026-06-03T10:24:03.264129Z  INFO ThreadId(01) logic: src/main.rs:52: Server listening on 0.0.0.0:8000
+2026-06-03T10:24:20.888447Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-03T10:24:20.888816Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-03T10:24:22.617736Z  INFO ThreadId(01) logic: src/main.rs:52: Server listening on 0.0.0.0:8000
+2026-06-03T10:25:15.553775Z ERROR ThreadId(10) logic::authentication::signup: src/authentication/signup.rs:144: DB insert failed: error returned from database: column "fullname" of relation "users" does not exist
+2026-06-03T10:25:15.553973Z ERROR ThreadId(10) tower_http::trace::on_failure: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-http-0.6.11/src/trace/on_failure.rs:93: response failed classification=Status code: 500 Internal Server Error latency=1298 ms
+2026-06-03T10:30:54.899610Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-03T10:30:54.900017Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-03T10:30:56.640842Z  INFO ThreadId(01) logic: src/main.rs:52: Server listening on 0.0.0.0:8000
+2026-06-03T10:31:05.429726Z ERROR ThreadId(02) logic::authentication::signup: src/authentication/signup.rs:143: DB insert failed: error returned from database: column "id" is of type uuid but expression is of type text
+2026-06-03T10:31:05.429899Z ERROR ThreadId(02) tower_http::trace::on_failure: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-http-0.6.11/src/trace/on_failure.rs:93: response failed classification=Status code: 500 Internal Server Error latency=1235 ms
+2026-06-03T10:37:19.855389Z  INFO ThreadId(01) logic: src/main.rs:26: Starting Backup service
+2026-06-03T10:37:19.855812Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-03T10:37:23.705103Z  WARN ThreadId(01) sqlx::pool::acquire: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:302: acquired connection, but time to acquire exceeded slow threshold aquired_after_secs=3.849137303 slow_acquire_threshold_secs=2.0
+2026-06-03T10:37:23.705911Z  INFO ThreadId(01) logic: src/main.rs:52: Server listening on 0.0.0.0:8000
+2026-06-03T10:55:07.088564Z  INFO ThreadId(13) sqlx_core::pool::inner: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:475: ping on idle connection returned error error=error communicating with database: expected to read 5 bytes, got 0 bytes at EOF
+2026-06-03T10:55:09.998233Z  WARN ThreadId(12) sqlx::pool::acquire: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:302: acquired connection, but time to acquire exceeded slow threshold aquired_after_secs=2.919354132 slow_acquire_threshold_secs=2.0
