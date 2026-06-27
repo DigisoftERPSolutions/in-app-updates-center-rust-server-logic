@@ -1,0 +1,3 @@
+2026-06-27T15:57:14.390532Z  INFO ThreadId(01) logic: src/main.rs:30: Starting Backup service
+2026-06-27T15:57:14.391075Z  WARN ThreadId(01) sqlx_postgres::options::parse: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-postgres-0.8.6/src/options/parse.rs:107: ignoring unrecognized connect parameter key=channel_binding value=require
+2026-06-27T15:57:16.292687Z  INFO ThreadId(01) logic: src/main.rs:59: Server listening on 0.0.0.0:8000
