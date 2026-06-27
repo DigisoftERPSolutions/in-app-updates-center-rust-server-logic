@@ -2,6 +2,7 @@
 
 mod authentication;
 mod configuration;
+mod telemetry;
 
 use axum::{http::Method, Router};
 use dotenvy::dotenv;
@@ -12,7 +13,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
 
-use crate::{authentication::{login::login_route, signup::signup_route}, configuration::operations::version_control};
+use crate::{
+    authentication::{login::login_route, signup::signup_route},
+    configuration::operations::version_control,
+    telemetry::pings::telemetry_route,
+};
 
 
 
@@ -43,7 +48,8 @@ println!("Signup mounted at: {}", &signup_path);
     let app = Router::new()
         .nest(&format!("{base_path}/signup"), signup_route(db.clone()))
         .nest(&format!("{base_path}/login"), login_route(db.clone()))
-        .nest(&format!("{base_path}/configure"), version_control(db.clone()) )
+        .nest(&format!("{base_path}/configure"), version_control(db.clone()))
+        .nest(&format!("{base_path}/telemetry"), telemetry_route(db.clone()))
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
@@ -53,7 +59,7 @@ println!("Signup mounted at: {}", &signup_path);
     tracing::info!("Server listening on {addr}");
     println!("Server listening on {}",addr);
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;
 
