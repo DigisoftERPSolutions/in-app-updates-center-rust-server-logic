@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 mod authentication;
+mod companies;
 mod configuration;
 mod telemetry;
 
@@ -15,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     authentication::{login::login_route, signup::signup_route},
+    companies::operations::companies_route,
     configuration::operations::version_control,
     telemetry::pings::telemetry_route,
 };
@@ -49,6 +51,7 @@ println!("Signup mounted at: {}", &signup_path);
         .nest(&format!("{base_path}/signup"), signup_route(db.clone()))
         .nest(&format!("{base_path}/login"), login_route(db.clone()))
         .nest(&format!("{base_path}/configure"), version_control(db.clone()))
+        .nest(&format!("{base_path}/companies"), companies_route(db.clone()))
         .nest(&format!("{base_path}/telemetry"), telemetry_route(db.clone()))
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http());
