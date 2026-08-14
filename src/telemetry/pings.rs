@@ -3,13 +3,16 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+
+use crate::authentication::guard::require_auth;
 
 #[derive(Debug, Deserialize)]
 pub struct TelemetryPayload {
@@ -56,9 +59,43 @@ pub struct PingQuery {
 fn default_page() -> i64 { 1 }
 fn default_page_size() -> i64 { 20 }
 
+#[derive(Serialize, sqlx::FromRow)]
+pub struct SummaryTotals {
+    pub total_pings: i64,
+    pub distinct_devices: i64,
+    pub distinct_companies: i64,
+    pub active_24h: i64,
+    pub active_1h: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct CompanyBreakdown {
+    pub company_url: String,
+    pub company_name: String,
+    pub company_prefix: String,
+    pub latest_version: String,
+    pub last_seen: DateTime<Utc>,
+    pub device_count: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct VersionBreakdown {
+    pub app_version: String,
+    pub device_count: i64,
+}
+
+/// Device pings (`POST /`) need no login — the mobile app never
+/// authenticates as a user. Everything that lets an admin browse the fleet
+/// (`GET /`, `GET /summary`) sits behind `require_auth`.
 pub fn telemetry_route(db: Arc<PgPool>) -> Router {
     Router::new()
-        .route("/", post(post_telemetry).get(get_telemetry))
+        .route("/", post(post_telemetry))
+        .merge(
+            Router::new()
+                .route("/", get(get_telemetry))
+                .route("/summary", get(get_telemetry_summary))
+                .route_layer(middleware::from_fn(require_auth)),
+        )
         .with_state(db)
 }
 
@@ -197,6 +234,82 @@ async fn get_telemetry(
         }
         Err(e) => {
             tracing::error!("[TELEMETRY] DB fetch error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Database error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /telemetry/summary — aggregate KPIs for the management dashboard.
+/// Deliberately pre-aggregated in SQL rather than shipping all ping rows to
+/// the client: the fleet is already in the thousands of pings and only grows.
+pub async fn get_telemetry_summary(State(db): State<Arc<PgPool>>) -> impl IntoResponse {
+    let totals = sqlx::query_as::<_, SummaryTotals>(
+        r#"
+        SELECT
+            COUNT(*)                                                                    AS total_pings,
+            COUNT(DISTINCT device_id)                                                   AS distinct_devices,
+            COUNT(DISTINCT company_url)                                                 AS distinct_companies,
+            COUNT(DISTINCT device_id) FILTER (WHERE pinged_at > NOW() - INTERVAL '24 hours') AS active_24h,
+            COUNT(DISTINCT device_id) FILTER (WHERE pinged_at > NOW() - INTERVAL '1 hour')    AS active_1h
+        FROM app_pings
+        "#,
+    )
+    .fetch_one(db.as_ref())
+    .await;
+
+    let by_company = sqlx::query_as::<_, CompanyBreakdown>(
+        r#"
+        WITH latest AS (
+            SELECT DISTINCT ON (company_url)
+                company_url, company_name, company_prefix,
+                app_version AS latest_version, pinged_at AS last_seen
+            FROM app_pings
+            ORDER BY company_url, pinged_at DESC
+        ),
+        counts AS (
+            SELECT company_url, COUNT(DISTINCT device_id) AS device_count
+            FROM app_pings
+            GROUP BY company_url
+        )
+        SELECT l.company_url, l.company_name, l.company_prefix,
+               l.latest_version, l.last_seen, c.device_count
+        FROM latest l
+        JOIN counts c ON c.company_url = l.company_url
+        ORDER BY l.last_seen DESC
+        "#,
+    )
+    .fetch_all(db.as_ref())
+    .await;
+
+    let by_version = sqlx::query_as::<_, VersionBreakdown>(
+        r#"
+        SELECT app_version, COUNT(DISTINCT device_id) AS device_count
+        FROM app_pings
+        GROUP BY app_version
+        ORDER BY app_version DESC
+        "#,
+    )
+    .fetch_all(db.as_ref())
+    .await;
+
+    match (totals, by_company, by_version) {
+        (Ok(totals), Ok(by_company), Ok(by_version)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "totals": totals,
+                "by_company": by_company,
+                "by_version": by_version,
+            })),
+        )
+            .into_response(),
+        (t, c, v) => {
+            if let Some(e) = t.as_ref().err().or(c.as_ref().err()).or(v.as_ref().err()) {
+                tracing::error!("[TELEMETRY] summary query failed: {e}");
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Database error" })),

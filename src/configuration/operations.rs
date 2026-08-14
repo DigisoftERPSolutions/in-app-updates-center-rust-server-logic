@@ -4,17 +4,30 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
+    middleware,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::authentication::guard::require_auth;
+
+/// `GET /` (list releases) is the mobile app's live update-check call —
+/// it's already deployed on real devices, calls with no auth at all, and
+/// must keep working unauthenticated (release metadata isn't sensitive).
+/// Creating/deleting releases is an admin action and stays behind
+/// `require_auth`.
 pub fn version_control(db: Arc<PgPool>) -> Router {
     Router::new()
-        .route("/", post(handle_version_post_control).get(get_version_uploads))
-        .route("/{id}", axum::routing::delete(delete_release))
+        .route("/", get(get_version_uploads))
+        .merge(
+            Router::new()
+                .route("/", post(handle_version_post_control))
+                .route("/{id}", axum::routing::delete(delete_release))
+                .route_layer(middleware::from_fn(require_auth)),
+        )
         .with_state(db)
 }
 

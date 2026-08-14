@@ -5,17 +5,17 @@ mod companies;
 mod configuration;
 mod telemetry;
 
-use axum::{http::Method, Router};
+use axum::{http::Method, middleware, Router};
 use dotenvy::dotenv;
-use sqlx::postgres::PgPoolOptions;
-use std::{env, net::SocketAddr, sync::Arc};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::{env, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    authentication::{login::login_route, signup::signup_route},
+    authentication::{guard::require_auth, login::login_route, signup::signup_route},
     companies::operations::companies_route,
     configuration::operations::version_control,
     telemetry::pings::telemetry_route,
@@ -35,10 +35,23 @@ async fn main() -> anyhow::Result<()> {
     let base_path    = env::var("BASE_URL")?; 
     let signup_path = format!("{base_path}/signup");  
 println!("Signup mounted at: {}", &signup_path);
+    // `DATABASE_URL` points at Neon's pooled endpoint (PgBouncer, transaction
+    // mode) rather than a direct Postgres connection. sqlx defaults to
+    // caching server-side prepared statements per-connection, but under
+    // transaction pooling the physical backend connection can change between
+    // statements — so a cached "prepared" statement from one backend gets
+    // replayed against another that never prepared it, and Postgres rejects
+    // it. That surfaces here as a generic query failure ("Database error")
+    // that gets worse under real concurrent load and is very hard to
+    // reproduce with a single quick request. Disabling the statement cache
+    // makes sqlx always send unprepared (simple-protocol) queries, which is
+    // safe for PgBouncer transaction pooling and is Neon's own recommended
+    // setting for sqlx. See https://neon.tech/docs/guides/sqlx
+    let connect_options = PgConnectOptions::from_str(&database_url)?.statement_cache_capacity(0);
     let db = Arc::new(
         PgPoolOptions::new()
             .max_connections(10)
-            .connect(&database_url)
+            .connect_with(connect_options)
             .await?,
     );
 
@@ -47,11 +60,21 @@ println!("Signup mounted at: {}", &signup_path);
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::PATCH])
         .allow_headers(Any);
 
+    // The sites directory is an admin-only surface — guard every method
+    // behind a valid session. `/configure` and `/telemetry` are each split
+    // internally by method (see `version_control` / `telemetry_route`):
+    // the mobile app calls `GET /configure` (update check) and
+    // `POST /telemetry` (device pings) with no login at all, and both are
+    // already live on real devices, so those two stay public while every
+    // admin mutation/view on the same routers stays behind `require_auth`.
     let app = Router::new()
         .nest(&format!("{base_path}/signup"), signup_route(db.clone()))
         .nest(&format!("{base_path}/login"), login_route(db.clone()))
         .nest(&format!("{base_path}/configure"), version_control(db.clone()))
-        .nest(&format!("{base_path}/companies"), companies_route(db.clone()))
+        .nest(
+            &format!("{base_path}/companies"),
+            companies_route(db.clone()).route_layer(middleware::from_fn(require_auth)),
+        )
         .nest(&format!("{base_path}/telemetry"), telemetry_route(db.clone()))
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http());

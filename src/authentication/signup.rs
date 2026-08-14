@@ -176,10 +176,14 @@ ORDER BY created_at DESC"#,
 /// DELETE /signup/:id
 pub async fn delete_user(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    // `id` column is `uuid`, not `text` — binding a bare String here made
+    // Postgres reject every call with a type-mismatch error (surfaced to the
+    // caller as a generic "Database error"). Path<Uuid> both validates the
+    // input and binds it as the right type.
     let result = sqlx::query(r#"DELETE FROM users WHERE id = $1"#)
-        .bind(&id)
+        .bind(id)
         .execute(state.db.as_ref())
         .await;
 
@@ -206,13 +210,23 @@ pub async fn delete_user(
 /// Body: { "username": "new_name" }  and/or  { "email": "new@email.com" }
 pub async fn update_user(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUserPayload>,
 ) -> impl IntoResponse {
-    // Build the SET clause dynamically — only update fields that were provided
-    let mut set_parts: Vec<&str> = Vec::new();
-    if payload.username.is_some() { set_parts.push("username = ?"); }
-    if payload.email.is_some()    { set_parts.push("email = ?");    }
+    // Build the SET clause dynamically — only update fields that were provided.
+    // Placeholders are numbered ($1, $2, ...) because sqlx's Postgres driver
+    // uses positional params, not the `?` (MySQL-style) placeholder the
+    // previous version used — that would fail on every call.
+    let mut set_parts: Vec<String> = Vec::new();
+    let mut next_param = 1;
+    if payload.username.is_some() {
+        set_parts.push(format!("username = ${next_param}"));
+        next_param += 1;
+    }
+    if payload.email.is_some() {
+        set_parts.push(format!("email = ${next_param}"));
+        next_param += 1;
+    }
 
     if set_parts.is_empty() {
         return (
@@ -222,15 +236,17 @@ pub async fn update_user(
     }
 
     let sql = format!(
-        "UPDATE users SET {} WHERE id = $1",
+        "UPDATE users SET {} WHERE id = ${next_param}",
         set_parts.join(", ")
     );
 
-    // Bind values in the same order as set_parts
+    // Bind values in the same order as set_parts. `id` is bound as a real
+    // Uuid (not text) — the `id` column is `uuid`, and binding a String
+    // against it made Postgres reject every call with a type mismatch.
     let mut query = sqlx::query(&sql);
     if let Some(ref username) = payload.username { query = query.bind(username); }
     if let Some(ref email)    = payload.email    { query = query.bind(email);    }
-    query = query.bind(&id);
+    query = query.bind(id);
 
     match query.execute(state.db.as_ref()).await {
         Ok(r) if r.rows_affected() == 0 => (
