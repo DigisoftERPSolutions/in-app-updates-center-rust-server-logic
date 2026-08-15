@@ -22,12 +22,13 @@ pub struct AppState {
 
 #[derive(Deserialize)]
 pub struct SignUpPayload {
-    pub fullName: String,
+    #[serde(rename = "fullName")]
+    pub full_name: String,
     pub email:    String,
     pub username: String,
     pub password: String,
-    pub confirmPassword:    String,
-    
+    #[serde(rename = "confirmPassword")]
+    pub confirm_password: String,
 }
 
 #[derive(Deserialize)]
@@ -74,7 +75,7 @@ pub async fn handle_sign_up(
 
     // 1. compare then hash the password with bcrypt
 
-    if payload.password != payload.confirmPassword {
+    if payload.password != payload.confirm_password {
     tracing::error!("Passwords do not match");
 
     return (
@@ -117,7 +118,7 @@ pub async fn handle_sign_up(
     "#,
 )
 .bind(&user_id)
-.bind(&payload.fullName)
+.bind(&payload.full_name)
 .bind(&payload.email)
 .bind(&payload.username)
 .bind(&hashed_password)
