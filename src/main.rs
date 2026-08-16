@@ -5,10 +5,10 @@ mod companies;
 mod configuration;
 mod telemetry;
 
-use axum::{http::Method, middleware, Router};
+use axum::{http::{Method, StatusCode}, middleware, response::IntoResponse, Json, Router};
 use dotenvy::dotenv;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use std::{env, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{any::Any as PanicPayload, env, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing_appender::rolling;
@@ -77,7 +77,13 @@ println!("Signup mounted at: {}", &signup_path);
         )
         .nest(&format!("{base_path}/telemetry"), telemetry_route(db.clone()))
         .layer(cors)
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // A panicking handler used to kill the connection outright — the
+        // client sees a bare network error with no status code or body,
+        // which is exactly what turns into an undiagnosable "Could not
+        // load fleet summary" on the dashboard with nothing to go on. This
+        // converts any panic into a normal logged 500 JSON response instead.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(handle_panic));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
     let listener = TcpListener::bind(addr).await?;
@@ -90,6 +96,22 @@ println!("Signup mounted at: {}", &signup_path);
         .await?;
 
     Ok(())
+}
+
+fn handle_panic(err: Box<dyn PanicPayload + Send + 'static>) -> axum::response::Response {
+    let detail = if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        "unknown panic".to_string()
+    };
+    tracing::error!("[PANIC] handler panicked: {detail}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "Internal server error" })),
+    )
+        .into_response()
 }
 
 async fn shutdown() {
