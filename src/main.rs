@@ -3,6 +3,7 @@
 mod authentication;
 mod companies;
 mod configuration;
+mod meter_ocr;
 mod telemetry;
 
 use axum::{http::{Method, StatusCode}, middleware, response::IntoResponse, Json, Router};
@@ -18,6 +19,7 @@ use crate::{
     authentication::{guard::require_auth, login::login_route, signup::signup_route},
     companies::operations::companies_route,
     configuration::operations::version_control,
+    meter_ocr::operations::meter_ocr_route,
     telemetry::pings::telemetry_route,
 };
 
@@ -76,6 +78,10 @@ println!("Signup mounted at: {}", &signup_path);
             companies_route(db.clone()).route_layer(middleware::from_fn(require_auth)),
         )
         .nest(&format!("{base_path}/telemetry"), telemetry_route(db.clone()))
+        // Public/no-login, same trust model as /configure and /telemetry above
+        // (see meter_ocr::operations::meter_ocr_route's doc comment for why
+        // this one still isn't a free-for-all despite that).
+        .nest(&format!("{base_path}/meter-ocr"), meter_ocr_route(db.clone()))
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         // A panicking handler used to kill the connection outright — the
