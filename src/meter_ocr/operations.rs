@@ -340,7 +340,14 @@ async fn call_claude(req: &FallbackRequest) -> Result<ClaudeMeterReading, Claude
 
     let body = serde_json::json!({
         "model": "claude-opus-5",
-        "max_tokens": 2048,
+        // Opus 5 runs adaptive thinking by default (not disabled here on
+        // purpose — see the model-migration notes on why disabling it on
+        // this model is its own footgun) and thinking tokens count against
+        // this ceiling. 2048 left no headroom for that plus the JSON
+        // response and was truncating some responses into a schema
+        // mismatch (`Upstream("response didn't match schema")`) that looked
+        // to the attendant exactly like "cloud reading unavailable."
+        "max_tokens": 4096,
         // Reading two rows off a clear photo is a short, scoped, low-
         // ambiguity task — not the kind of work that benefits from this
         // model's default high-effort deliberation.
@@ -377,27 +384,18 @@ async fn call_claude(req: &FallbackRequest) -> Result<ClaudeMeterReading, Claude
         }]
     });
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ClaudeCallError::Upstream(format!("request failed: {e}")))?;
+    // Bounded well under the app's own 30s axios timeout (see
+    // `meter_ocr_fallback_api.ts`) so a slow upstream fails HERE, with a
+    // real JSON error body the app can show, rather than the client giving
+    // up first with no response at all — that's exactly the generic
+    // "Could not reach the cloud reading service" dead end this is meant
+    // to avoid.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(25))
+        .build()
+        .map_err(|e| ClaudeCallError::Upstream(format!("client build failed: {e}")))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(ClaudeCallError::Upstream(format!("HTTP {status}: {text}")));
-    }
-
-    let parsed: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| ClaudeCallError::Upstream(format!("bad JSON response: {e}")))?;
+    let parsed = send_with_retry(&client, &api_key, &body).await?;
 
     if parsed.get("stop_reason").and_then(|v| v.as_str()) == Some("refusal") {
         return Err(ClaudeCallError::Declined);
@@ -419,6 +417,65 @@ async fn call_claude(req: &FallbackRequest) -> Result<ClaudeMeterReading, Claude
     }
 
     Ok(reading)
+}
+
+/// One retry, short fixed backoff, and ONLY for failures that are plausibly
+/// transient: a network-level error (`Client::send` itself failing —
+/// connect/TLS/timeout) or a 5xx from Anthropic (server-side overload,
+/// gateway hiccup). A 4xx (bad request, auth, invalid image) means retrying
+/// the exact same body would just fail the exact same way, so those return
+/// immediately on the first attempt. This is the whole difference between
+/// "a single flaky call away from the attendant" and "the attendant has to
+/// notice, tap the button again themselves, and hope" — the retry happens
+/// inside the one request the app already made, invisibly.
+async fn send_with_retry(
+    client: &reqwest::Client,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, ClaudeCallError> {
+    let mut last_err = None;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        }
+
+        let sent = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await;
+
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_err = Some(format!("request failed: {e}"));
+                continue; // network/timeout — worth the one retry
+            }
+        };
+
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| ClaudeCallError::Upstream(format!("bad JSON response: {e}")));
+        }
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_server_error() {
+            last_err = Some(format!("HTTP {status}: {text}"));
+            continue; // 5xx — worth the one retry
+        }
+        // 4xx — same body would fail the same way again, don't waste the retry.
+        return Err(ClaudeCallError::Upstream(format!("HTTP {status}: {text}")));
+    }
+
+    Err(ClaudeCallError::Upstream(
+        last_err.unwrap_or_else(|| "exhausted retries".to_string()),
+    ))
 }
 
 /// Deferred insert into `meter_ocr_fallback_calls` — built once the outcome
