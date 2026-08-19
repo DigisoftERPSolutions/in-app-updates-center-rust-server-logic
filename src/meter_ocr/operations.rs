@@ -8,72 +8,98 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::PgPool;
 
-/// Same per-company daily ceiling regardless of how many stations/devices a
-/// company runs — cheap to raise later (env var) if a real customer needs
-/// more, but a fixed constant is enough to turn "a bug/loop calls this in a
-/// tight retry loop" into a bounded cost instead of an open-ended one. For
-/// scale: at ~2 meter photos/nozzle/shift, a station with 10 nozzles running
-/// 2 shifts/day is 40 *captures*, and this fallback only fires on captures
-/// the free on-device OCR already failed — 300 successful fallback CALLS in
-/// a day means something is actually wrong (stuck retry loop, most captures
-/// failing), which is exactly when you'd want this to start returning 429s
-/// rather than quietly running up the Anthropic bill further.
-const DAILY_FALLBACK_CAP_PER_COMPANY: i64 = 300;
+/// Fallback used only when `METER_OCR_DAILY_CAP_PER_COMPANY` is unset or
+/// doesn't parse as an i64. Raised from the old fallback-era default of 300:
+/// this endpoint (`/meter-ocr/read`) is now called on every meter-photo
+/// capture the app takes — open AND close, every nozzle — not just the rare
+/// case where on-device OCR already failed. At, say, 20 nozzles x 2
+/// shifts/day x a couple of retakes each, a single busy station alone can
+/// comfortably clear a few hundred calls/day, so 300 would false-trip on
+/// perfectly normal usage. 2000 keeps the same purpose the old cap had (turn
+/// "something is actually wrong" into a bounded cost instead of an
+/// open-ended one) without being a normal-day nuisance.
+const DEFAULT_DAILY_CAP_PER_COMPANY: i64 = 2000;
 
-/// Meter-OCR cloud fallback — POST /meter-ocr/fallback, same public/no-login
-/// trust model as GET /configure and POST /telemetry (the mobile app never
-/// authenticates as a user for any device-facing endpoint on this service).
-/// Unlike those two, every call here costs real money (an Anthropic API
-/// call), so it's the one device endpoint that also validates the caller's
-/// (company_url, company_prefix) against the `companies` directory and
-/// enforces `DAILY_FALLBACK_CAP_PER_COMPANY` — see `meter_ocr_fallback` below.
+/// Fallback for `MAX_LITERS_DELTA_PER_SHIFT` when unset/unparseable. A
+/// station's busiest single shift moving this many litres across one nozzle
+/// would be extraordinary — this exists to catch "the model misread a digit
+/// and the totalizer looks like it jumped by 500,000 litres", not to model
+/// real fuel throughput precisely.
+const DEFAULT_MAX_LITERS_DELTA_PER_SHIFT: f64 = 20000.0;
+
+/// Fallback for `SALE_NUMBER_ROLLOVER_CEILING` when unset/unparseable. Most
+/// pump displays we've seen wrap their sale/transaction counter back to 0/1
+/// somewhere in the 4-5 digit range; 99999 is a safe assumption until we
+/// have a per-company reason to say otherwise (see the `companies` table
+/// override column added in migration 007).
+const DEFAULT_SALE_NUMBER_ROLLOVER_CEILING: i64 = 99999;
+
+/// Meter-OCR — two device-facing endpoints, same public/no-login trust model
+/// as GET /configure and POST /telemetry (the mobile app never authenticates
+/// as a user for any device-facing endpoint on this service):
+///
+/// - `POST /read` sends a meter photo and gets back a structured reading.
+///   Every call costs real money (a Gemini API call), so — like the
+///   `/fallback` endpoint this replaces — it validates the caller's
+///   (company_url, company_prefix) against the `companies` directory and
+///   enforces a per-company daily cap before spending anything.
+/// - `POST /confirm` sends the attendant's final confirmed numbers (no
+///   image, no Gemini call) so we can update the "last known reading"
+///   used for next time's anomaly checks and keep a permanent audit trail.
+///
+/// The old single `/fallback` endpoint (occasional manual escape hatch when
+/// on-device OCR failed) is gone — `/read` is now the primary read path
+/// called on every capture, paired with `/confirm` recording what the
+/// attendant actually went with.
 pub fn meter_ocr_route(db: Arc<PgPool>) -> Router {
     Router::new()
-        .route("/fallback", post(meter_ocr_fallback))
+        .route("/read", post(meter_ocr_read))
+        .route("/confirm", post(meter_ocr_confirm))
         .with_state(db)
 }
 
-/// Mirrors `MeterMode` in the app's ocrParser.ts — kept as a bare string
-/// over the wire (not a typed enum) since this struct is filled from
-/// multipart form fields, all of which axum hands back as `String`.
+/// Filled from multipart form fields, all of which axum hands back as
+/// `String` — kept as bare strings rather than typed enums for the same
+/// reason the old `FallbackRequest` did.
 #[derive(Debug)]
-struct FallbackRequest {
+struct ReadRequest {
     company_prefix: String,
     company_url: String,
     site: String,
     device_id: String,
-    expected_mode: String,
-    previous_value: Option<f64>,
+    pump_id: String,
+    nozzle_id: String,
+    shift_event: String, // "open" | "close"
     image_bytes: Vec<u8>,
     image_media_type: String,
 }
 
-/// The only thing Claude is asked to do is read the two totalizer rows off
-/// the photo — it does NOT combine them into one cumulative value. That
-/// combination (stray-dot stripping, implied-decimal fallback, wrap-around
-/// block math via `previous_value`) is real business logic that already
-/// lives once, client-side, in `combineTopBottom`/`inferTopBlock`
-/// (ocrParser.ts) — duplicating it here in Rust would mean two
-/// implementations of the same rule drifting apart. So this endpoint hands
-/// back raw digit tokens and lets the app run them through the exact same
-/// parsing path a successful on-device OCR read would have used.
+/// What the model is asked for: the two rows exactly as displayed, nothing
+/// combined or computed. Turning `sale_token`/`liters_token` into
+/// `sale_number`/`liters`/`reading` and running the anomaly checks is real
+/// business logic and lives in plain Rust functions below (`parse_sale_token`,
+/// `parse_liters_token`, `compute_reading`, `liters_decreased`,
+/// `delta_too_large`, `sale_number_regression`) — never delegated to the
+/// model, so it can't drift between calls or hide behind opaque reasoning.
 #[derive(Debug, Deserialize)]
-struct ClaudeMeterReading {
-    /// "LL" | "PP" | "unclear" — deliberately not constrained to the same
-    /// two-letter set the app's OCR fuzzy-matches (11/IL/LI/L1/1L/II handle
-    /// on-device misreads of the *glyphs*; asking an LLM to read a label is
-    /// a different failure mode, so it just says what it saw).
-    label_seen: String,
-    top_token: String,
-    bottom_token: String,
-    #[allow(dead_code)] // logged for the cost/quality dashboard, not branched on yet
+struct MeterReadingTokens {
+    /// Exact digits for the SALE ("LL") row, e.g. "0009" or "9". Empty
+    /// string if genuinely illegible.
+    sale_token: String,
+    /// Exact digits + decimal point for the LITERS row, e.g. "7530.22".
+    /// Empty string if genuinely illegible.
+    liters_token: String,
+    /// "high" | "medium" | "low"
     confidence: String,
+    /// Brief free-text note on which digit(s)/row were ambiguous, else "".
+    uncertain_digits: String,
 }
 
-async fn meter_ocr_fallback(
+async fn meter_ocr_read(
     State(db): State<Arc<PgPool>>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
@@ -82,19 +108,20 @@ async fn meter_ocr_fallback(
         Err(msg) => return bad_request(&msg),
     };
 
-    if !matches!(req.expected_mode.as_str(), "volume" | "price") {
-        return bad_request("expected_mode must be \"volume\" or \"price\"");
+    if !matches!(req.shift_event.as_str(), "open" | "close") {
+        return bad_request("shift_event must be \"open\" or \"close\"");
     }
 
-    // Reject an unrecognized (company_url, company_prefix) pair up front —
-    // same directory `get_version_uploads` already trusts for release
-    // scoping, reused here purely as a "is this even one of our stations"
-    // gate before spending money on an API call. NOT a security boundary
-    // (both values are visible, guessable strings already sent on every
-    // /configure and /telemetry call) — just enough to keep a stray script
-    // hitting this URL from a browser tab from costing anything.
-    let known_company: Option<(bool,)> = sqlx::query_as(
-        "SELECT EXISTS(SELECT 1 FROM companies WHERE company_url = $1 AND company_prefix = $2)",
+    // Single query does double duty: it's both the "is this even one of our
+    // stations" allow-list check (same non-security-boundary purpose the
+    // old /fallback endpoint's separate EXISTS query served — just enough to
+    // keep a stray script hitting this URL from costing anything) AND the
+    // lookup for this company's optional per-company anomaly-threshold
+    // overrides (see migration 007). NULL columns mean "use the env-var/
+    // built-in default", handled further down.
+    let company: Option<(Option<f64>, Option<i64>)> = sqlx::query_as(
+        r#"SELECT max_liters_delta_per_shift, sale_number_rollover_ceiling
+           FROM companies WHERE company_url = $1 AND company_prefix = $2"#,
     )
     .bind(&req.company_url)
     .bind(&req.company_prefix)
@@ -102,9 +129,29 @@ async fn meter_ocr_fallback(
     .await
     .unwrap_or(None);
 
-    if !known_company.map(|(exists,)| exists).unwrap_or(false) {
-        return bad_request("unrecognized company_url/company_prefix");
-    }
+    let (company_max_delta, company_rollover_ceiling) = match company {
+        Some(pair) => pair,
+        None => {
+            // Distinct error code from generic `bad_request` — the client
+            // contract treats "we don't recognize this company" as its own
+            // case (e.g. worth surfacing differently from a malformed
+            // request), not lumped in with shift_event validation errors.
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "unrecognized_company",
+                    "message": "unrecognized company_url/company_prefix",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let daily_cap = std::env::var("METER_OCR_DAILY_CAP_PER_COMPANY")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_DAILY_CAP_PER_COMPANY);
 
     let today_count: Option<(i64,)> = sqlx::query_as(
         r#"SELECT COUNT(*) FROM meter_ocr_fallback_calls
@@ -115,87 +162,141 @@ async fn meter_ocr_fallback(
     .await
     .unwrap_or(None);
 
-    if today_count.map(|(c,)| c).unwrap_or(0) >= DAILY_FALLBACK_CAP_PER_COMPANY {
+    if today_count.map(|(c,)| c).unwrap_or(0) >= daily_cap {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
                 "success": false,
                 "error": "daily_cap_reached",
-                "message": "This company has hit its daily meter-OCR fallback limit — contact support if this is a real spike in captures, not a stuck retry.",
+                "message": "This company has hit its daily meter-OCR limit — contact support if this is a real spike in captures, not a stuck retry loop.",
             })),
         )
             .into_response();
     }
 
-    let outcome = call_claude(&req).await;
+    // Last CONFIRMED reading for this exact nozzle, written only by
+    // /confirm — never by /read itself — so a bad model guess can never
+    // poison the baseline the next anomaly check compares against.
+    let last_state: Option<(Option<f64>, Option<i64>)> = sqlx::query_as(
+        r#"SELECT last_liters, last_sale_number FROM pump_reading_state
+           WHERE company_prefix = $1 AND company_url = $2 AND site = $3
+             AND pump_id = $4 AND nozzle_id = $5"#,
+    )
+    .bind(&req.company_prefix)
+    .bind(&req.company_url)
+    .bind(&req.site)
+    .bind(&req.pump_id)
+    .bind(&req.nozzle_id)
+    .fetch_optional(db.as_ref())
+    .await
+    .unwrap_or(None);
+    let (last_liters, last_sale_number) = last_state.unwrap_or((None, None));
+
+    let model = resolve_gemini_model();
+    let outcome = call_gemini(&req, &model).await;
 
     let (status, body, log) = match &outcome {
         Ok(reading) => {
-            let mode = match reading.label_seen.as_str() {
-                "LL" => Some("volume"),
-                "PP" => Some("price"),
-                _ => None,
-            };
-            match mode {
-                None => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    serde_json::json!({
-                        "success": false,
-                        "error": "no_mode_label",
-                        "message": "Couldn't find a clear PP/LL label in the photo.",
-                    }),
-                    FallbackLog::failed(&req, "no_mode_label"),
-                ),
-                Some(mode) if mode != req.expected_mode => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    serde_json::json!({
-                        "success": false,
-                        "error": "wrong_mode",
-                        "message": format!("Photo shows the {mode} screen, expected {}.", req.expected_mode),
-                    }),
-                    FallbackLog::failed(&req, "wrong_mode"),
-                ),
-                Some(mode) => (
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "success": true,
-                        "mode": mode,
-                        "top_token": reading.top_token,
-                        "bottom_token": reading.bottom_token,
-                        "confidence": reading.confidence,
-                    }),
-                    FallbackLog::succeeded(&req, reading),
-                ),
+            let sale_number = parse_sale_token(&reading.sale_token);
+            let liters = parse_liters_token(&reading.liters_token);
+            let reading_value = compute_reading(liters, &reading.sale_token, &reading.liters_token);
+
+            let mut anomalies: Vec<String> = Vec::new();
+
+            if let (Some(l), Some(last_l)) = (liters, last_liters) {
+                if liters_decreased(l, last_l) {
+                    anomalies.push("liters_decreased".to_string());
+                }
+                let max_delta = company_max_delta
+                    .or_else(|| {
+                        std::env::var("MAX_LITERS_DELTA_PER_SHIFT")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                    })
+                    .unwrap_or(DEFAULT_MAX_LITERS_DELTA_PER_SHIFT);
+                if delta_too_large(l, last_l, max_delta) {
+                    anomalies.push("delta_too_large".to_string());
+                }
             }
+
+            if let (Some(sn), Some(last_sn)) = (sale_number, last_sale_number) {
+                let ceiling = company_rollover_ceiling
+                    .or_else(|| {
+                        std::env::var("SALE_NUMBER_ROLLOVER_CEILING")
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                    })
+                    .unwrap_or(DEFAULT_SALE_NUMBER_ROLLOVER_CEILING);
+                if sale_number_regression(sn, last_sn, ceiling) {
+                    anomalies.push("sale_number_regression".to_string());
+                }
+            }
+
+            let needs_review = reading.confidence == "low"
+                || !anomalies.is_empty()
+                || sale_number.is_none()
+                || liters.is_none();
+
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "success": true,
+                    "sale_token": reading.sale_token,
+                    "liters_token": reading.liters_token,
+                    "sale_number": sale_number,
+                    "liters": liters,
+                    "reading": reading_value,
+                    "confidence": reading.confidence,
+                    "uncertain_digits": reading.uncertain_digits,
+                    "anomalies": anomalies,
+                    "needs_review": needs_review,
+                    "last_liters": last_liters,
+                    "last_sale_number": last_sale_number,
+                    "model": &model,
+                }),
+                ReadLog::succeeded(&req, reading, &model),
+            )
         }
-        Err(ClaudeCallError::Declined) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
+        Err(VisionCallError::Declined) => (
+            StatusCode::BAD_GATEWAY,
             serde_json::json!({
                 "success": false,
                 "error": "declined",
-                "message": "The cloud reading was declined — enter the reading manually below.",
+                "message": "The cloud reading was declined — enter the reading manually.",
             }),
-            FallbackLog::failed(&req, "declined"),
+            ReadLog::failed(&req, "declined", &model),
         ),
-        Err(ClaudeCallError::NoTextDetected) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
+        Err(VisionCallError::NoTextDetected) => (
+            StatusCode::BAD_GATEWAY,
             serde_json::json!({
                 "success": false,
                 "error": "no_text_detected",
                 "message": "Couldn't make out the display in this photo — retake with better lighting/focus.",
             }),
-            FallbackLog::failed(&req, "no_text_detected"),
+            ReadLog::failed(&req, "no_text_detected", &model),
         ),
-        Err(ClaudeCallError::Upstream(msg)) => {
-            tracing::error!("[METER_OCR] Anthropic call failed: {msg}");
+        Err(VisionCallError::RateLimited(msg)) => {
+            tracing::error!("[METER_OCR] Gemini call rate-limited: {msg}");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({
+                    "success": false,
+                    "error": "rate_limited",
+                    "message": "The meter reading service is busy right now — wait a few seconds and try again, or enter the reading manually.",
+                }),
+                ReadLog::failed(&req, "rate_limited", &model),
+            )
+        }
+        Err(VisionCallError::SchemaMismatch(msg)) | Err(VisionCallError::Upstream(msg)) => {
+            tracing::error!("[METER_OCR] Gemini call failed: {msg}");
             (
                 StatusCode::BAD_GATEWAY,
                 serde_json::json!({
                     "success": false,
-                    "error": "upstream_unavailable",
+                    "error": "upstream_error",
                     "message": "Cloud reading is temporarily unavailable — try again, or enter the reading manually.",
                 }),
-                FallbackLog::failed(&req, "upstream_unavailable"),
+                ReadLog::failed(&req, "upstream_unavailable", &model),
             )
         }
     };
@@ -213,13 +314,14 @@ fn bad_request(message: &str) -> axum::response::Response {
         .into_response()
 }
 
-async fn parse_multipart(multipart: &mut Multipart) -> Result<FallbackRequest, String> {
+async fn parse_multipart(multipart: &mut Multipart) -> Result<ReadRequest, String> {
     let mut company_prefix = None;
     let mut company_url = None;
     let mut site = None;
     let mut device_id = None;
-    let mut expected_mode = None;
-    let mut previous_value = None;
+    let mut pump_id = None;
+    let mut nozzle_id = None;
+    let mut shift_event = None;
     let mut image_bytes = None;
     let mut image_media_type = "image/jpeg".to_string();
 
@@ -255,28 +357,21 @@ async fn parse_multipart(multipart: &mut Multipart) -> Result<FallbackRequest, S
             "company_url" => company_url = Some(text_field(field).await?),
             "site" => site = Some(text_field(field).await?),
             "device_id" => device_id = Some(text_field(field).await?),
-            "expected_mode" => expected_mode = Some(text_field(field).await?),
-            "previous_value" => {
-                let raw = text_field(field).await?;
-                if !raw.trim().is_empty() {
-                    previous_value = Some(
-                        raw.trim()
-                            .parse::<f64>()
-                            .map_err(|_| "previous_value must be a number".to_string())?,
-                    );
-                }
-            }
+            "pump_id" => pump_id = Some(text_field(field).await?),
+            "nozzle_id" => nozzle_id = Some(text_field(field).await?),
+            "shift_event" => shift_event = Some(text_field(field).await?),
             _ => {} // ignore unknown fields rather than rejecting the whole request
         }
     }
 
-    Ok(FallbackRequest {
+    Ok(ReadRequest {
         company_prefix: company_prefix.ok_or("missing company_prefix")?,
         company_url: company_url.ok_or("missing company_url")?,
         site: site.unwrap_or_default(),
         device_id: device_id.unwrap_or_default(),
-        expected_mode: expected_mode.ok_or("missing expected_mode")?,
-        previous_value,
+        pump_id: pump_id.ok_or("missing pump_id")?,
+        nozzle_id: nozzle_id.ok_or("missing nozzle_id")?,
+        shift_event: shift_event.ok_or("missing shift_event")?,
         image_bytes: image_bytes.ok_or("missing image")?,
         image_media_type,
     })
@@ -289,169 +384,298 @@ async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String
         .map_err(|e| format!("could not read form field: {e}"))
 }
 
-enum ClaudeCallError {
-    /// Safety classifiers declined the request (`stop_reason: "refusal"`).
-    /// Vanishingly unlikely for a pump-display photo, but Claude Opus 5 can
-    /// decline any request, so this has to be a distinct branch rather than
-    /// an assumed-successful response.
+// ---------------------------------------------------------------------------
+// Deterministic combine + anomaly logic — plain Rust, not delegated to the
+// model. Kept as small standalone functions so the rules are easy to read
+// (and test) independently of the request/response plumbing around them.
+// ---------------------------------------------------------------------------
+
+/// Leading zeros are fine — integer parsing just drops them, which is
+/// exactly the value we want (`"0009"` -> `9`).
+fn parse_sale_token(token: &str) -> Option<i64> {
+    let t = token.trim();
+    if t.is_empty() {
+        None
+    } else {
+        t.parse::<i64>().ok()
+    }
+}
+
+fn parse_liters_token(token: &str) -> Option<f64> {
+    let t = token.trim();
+    if t.is_empty() {
+        None
+    } else {
+        t.parse::<f64>().ok()
+    }
+}
+
+/// Pastes only the LAST digit of the SALE ("LL") counter row in front of
+/// the exact LITERS token, then parses that as one number — e.g. SALE
+/// "00012", LITERS "4567.89" -> "2" + "4567.89" -> `24567.89`, NOT
+/// `124567.89`. It's the last digit only, not the whole parsed counter:
+/// the SALE register overflows past its own display width every ~10
+/// units, so LITERS's own leading digit is exactly what that overflow
+/// would have carried into — anything in SALE beyond the ones digit is
+/// redundant with what LITERS already shows correctly on its own. Pasting
+/// the whole counter (e.g. "12") would double-count that overflow and
+/// produce a reading with extra leading digits.
+///
+/// Deliberately takes the raw `sale_token` string (not the parsed
+/// `sale_number`) so it can pull the last character directly, with no
+/// reformatting/precision loss on the `liters_token` side either — same
+/// reasoning as before for pasting the exact displayed string rather than
+/// reconstructing it from the parsed `liters` float.
+///
+/// `sale_number` (the full parsed counter) is untouched by this fix and
+/// still used elsewhere in this file — `sale_number_regression` and the
+/// audit trail/response both need the whole counter value, just not this
+/// concatenation.
+fn compute_reading(liters: Option<f64>, sale_token: &str, liters_token: &str) -> Option<f64> {
+    liters?;
+    let last_digit = sale_token.trim().chars().last().filter(char::is_ascii_digit)?;
+    format!("{last_digit}{liters_token}").parse::<f64>().ok()
+}
+
+fn liters_decreased(liters: f64, last_liters: f64) -> bool {
+    liters < last_liters
+}
+
+fn delta_too_large(liters: f64, last_liters: f64, max_delta: f64) -> bool {
+    (liters - last_liters) > max_delta
+}
+
+/// A lower sale number than last time is either (a) a genuine misread/bad
+/// data, or (b) the pump's counter plausibly wrapped back around near its
+/// display ceiling (e.g. last=99998, ceiling=99999, new=5 after a wrap).
+/// The two look very different in how far they drop: a real wrap drops by
+/// an amount close to the whole ceiling (last_sale_number - sale_number is
+/// large), while accidental bad data (wrong pump, fat-fingered entry, stale
+/// cache) typically drops by a small amount relative to the ceiling. We use
+/// "drop >= 90% of the ceiling" as the wrap heuristic — deliberately
+/// conservative toward flagging a regression when unsure, since a false
+/// positive here just makes the attendant double check (safe), while a
+/// false negative would silently accept a bad read as a legitimate wrap.
+fn sale_number_regression(sale_number: i64, last_sale_number: i64, rollover_ceiling: i64) -> bool {
+    if sale_number >= last_sale_number {
+        return false;
+    }
+    let drop = last_sale_number - sale_number;
+    let looks_like_rollover = drop >= (rollover_ceiling * 9 / 10);
+    !looks_like_rollover
+}
+
+// ---------------------------------------------------------------------------
+// Gemini call
+// ---------------------------------------------------------------------------
+
+enum VisionCallError {
+    /// The model declined to produce a reading — Gemini's equivalent of a
+    /// safety refusal: an empty `candidates` array (the whole prompt was
+    /// blocked, see `promptFeedback.blockReason`) or a candidate whose own
+    /// `finishReason` is `SAFETY`/`RECITATION`. Vanishingly unlikely for a
+    /// pump-display photo, but worth its own branch rather than an assumed-
+    /// successful response.
     Declined,
-    /// A well-formed response that plainly isn't a reading — e.g. the model
-    /// says so directly, or every token field comes back empty.
+    /// A well-formed response that plainly isn't a reading — both token
+    /// fields came back empty.
     NoTextDetected,
-    /// Network/HTTP/parse failure talking to the Anthropic API, or a
-    /// non-2xx response. Carries a short message for the server log only —
-    /// never echoed to the client (see `ClaudeCallError::Upstream` handling
-    /// in `meter_ocr_fallback`, which returns a fixed, generic message).
+    /// A 200 response whose JSON text didn't parse/validate into
+    /// `MeterReadingTokens` — including a response cut off by
+    /// `finishReason: "MAX_TOKENS"` before it finished writing valid JSON.
+    /// Kept distinct from `Upstream` so `call_gemini` can retry ONLY this
+    /// failure mode once, same image, per spec — a network/5xx/429 failure
+    /// already gets its own retry inside `send_with_retry`, and this is a
+    /// separate, outer retry layer on top of that for "the call succeeded
+    /// but the payload was junk".
+    SchemaMismatch(String),
+    /// HTTP 429 from Gemini, surviving `send_with_retry`'s own one retry
+    /// (with a longer, rate-limit-appropriate backoff — see that
+    /// function). Kept distinct from `Upstream` so the app can tell the
+    /// attendant "the service is busy, try again shortly" instead of a
+    /// generic failure message — a meaningfully different, and likely
+    /// self-resolving, situation compared to an actual outage.
+    RateLimited(String),
+    /// Network/HTTP failure talking to the Gemini API, or a non-2xx
+    /// response that isn't one of the above. Carries a short message for
+    /// the server log only — never echoed to the client.
     Upstream(String),
 }
 
-/// The actual "how do the two rows become one cumulative value" combine
-/// step is intentionally NOT here — see `ClaudeMeterReading`'s doc comment.
-/// This function's only job is turning a photo into `{label, top, bottom}`.
-async fn call_claude(req: &FallbackRequest) -> Result<ClaudeMeterReading, ClaudeCallError> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| ClaudeCallError::Upstream("ANTHROPIC_API_KEY not set".to_string()))?;
+/// `GEMINI_MODEL` lets ops swap models via `.env` alone (no redeploy)
+/// if/when Google renames or deprecates the default — model availability
+/// under this API has moved fast enough that hardcoding one string here
+/// would likely be the first thing to go stale.
+fn resolve_gemini_model() -> String {
+    std::env::var("GEMINI_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "gemini-2.5-flash".to_string())
+}
+
+/// Wraps `call_gemini_once` with exactly one extra retry, and ONLY for
+/// `SchemaMismatch` — see that variant's doc comment. Network/5xx/429
+/// retries are already handled one layer down inside `send_with_retry`, so
+/// this is deliberately not a generic "retry everything" loop.
+async fn call_gemini(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
+    match call_gemini_once(req, model).await {
+        Err(VisionCallError::SchemaMismatch(_)) => call_gemini_once(req, model).await,
+        other => other,
+    }
+}
+
+async fn call_gemini_once(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| VisionCallError::Upstream("GEMINI_API_KEY not set".to_string()))?;
 
     let image_b64 = STANDARD.encode(&req.image_bytes);
 
-    let previous_value_hint = match req.previous_value {
-        Some(v) => format!(
-            "The nozzle's last confirmed combined reading was approximately {v:.2}. \
-             If the top reference-number row is illegible, you may still report the bottom \
-             row alone and leave top_token empty — the caller can recover the top block from \
-             this previous value the same way the on-device OCR path already does."
-        ),
-        None => "No previous reading is available for this nozzle.".to_string(),
-    };
-
-    let prompt = format!(
-        "This is a photo of a fuel pump's LCD totalizer display. The display always shows a \
-         two-letter mode label (LL for cumulative volume in litres, or PP for cumulative price \
-         in KSh) followed by two stacked numeric rows: a short whole-number reference row on \
-         top, and a longer decimal row below it that is the actual reading. Expected mode for \
-         this capture: {}. {previous_value_hint}\n\n\
-         Read the label and both rows exactly as displayed, digit for digit — do not combine \
-         them into one number, do not guess a decimal point that isn't visibly lit on the LCD, \
-         and do not correct for what a 'plausible' reading might be. If a row is genuinely not \
-         legible, report an empty string for that token rather than guessing. If you cannot \
-         find the label at all, set label_seen to \"unclear\".",
-        req.expected_mode
-    );
+    let prompt = "This is a photo of a fuel pump's digital totalizer display. Reading top to \
+bottom, the display shows up to three rows: SALE (labeled \"LL\" on-screen — a short \
+whole-number transaction/sale counter), LITERS (below it — a decimal cumulative volume \
+totalizer), and sometimes a PRICE row below that. Ignore any PRICE row completely if it's \
+present in the photo — never read or report it, it isn't relevant here.\n\n\
+Read the SALE row and the LITERS row carefully. Seven-segment displays like this one commonly \
+cause specific digit confusions — 0/8/9, 1/7, 3/8, 5/6 — especially where a segment is dim, \
+viewed at an angle, or has glare on it. Reason about each digit's individual shape before \
+deciding what it is, rather than pattern-matching the row as a whole.\n\n\
+Return sale_token and liters_token as the EXACT digit strings shown on the display, not as \
+parsed or re-formatted numbers — preserve leading zeros in sale_token, and preserve the decimal \
+point exactly where it's lit in liters_token. If a row is genuinely illegible after careful \
+reasoning, return an empty string for that token rather than guessing at a plausible value.\n\n\
+If there is genuine doubt about any digit, set confidence to \"low\" and use uncertain_digits \
+to note which digit(s) and which row were ambiguous — do not silently guess and report high \
+confidence.".to_string();
 
     let body = serde_json::json!({
-        "model": "claude-opus-5",
-        // Opus 5 runs adaptive thinking by default (not disabled here on
-        // purpose — see the model-migration notes on why disabling it on
-        // this model is its own footgun) and thinking tokens count against
-        // this ceiling. 2048 left no headroom for that plus the JSON
-        // response and was truncating some responses into a schema
-        // mismatch (`Upstream("response didn't match schema")`) that looked
-        // to the attendant exactly like "cloud reading unavailable."
-        "max_tokens": 4096,
-        // Reading two rows off a clear photo is a short, scoped, low-
-        // ambiguity task — not the kind of work that benefits from this
-        // model's default high-effort deliberation.
-        "output_config": {
-            "effort": "low",
-            "format": {
-                "type": "json_schema",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "label_seen": { "type": "string", "enum": ["LL", "PP", "unclear"] },
-                        "top_token": { "type": "string" },
-                        "bottom_token": { "type": "string" },
-                        "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
-                    },
-                    "required": ["label_seen", "top_token", "bottom_token", "confidence"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        "messages": [{
-            "role": "user",
-            "content": [
+        "contents": [{
+            "parts": [
                 {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": req.image_media_type,
+                    "inline_data": {
+                        "mime_type": req.image_media_type,
                         "data": image_b64,
                     }
                 },
-                { "type": "text", "text": prompt }
+                { "text": prompt }
             ]
-        }]
+        }],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            // Gemini's schema dialect is an OpenAPI-3.0 subset — uppercase
+            // type names, no "additionalProperties" support — rather than
+            // plain JSON Schema, but the same 4 required fields as before.
+            "response_schema": {
+                "type": "OBJECT",
+                "properties": {
+                    "sale_token": { "type": "STRING" },
+                    "liters_token": { "type": "STRING" },
+                    "confidence": { "type": "STRING", "enum": ["high", "medium", "low"] },
+                    "uncertain_digits": { "type": "STRING" }
+                },
+                "required": ["sale_token", "liters_token", "confidence", "uncertain_digits"]
+            },
+            // Digit-reading has no upside from sampling variety. Claude
+            // Opus 5 relied on structured output alone for determinism
+            // (it had removed temperature entirely); Gemini still exposes
+            // it, so pin it to 0 rather than leave it at a default that
+            // invites read-to-read variance on the same photo.
+            "temperature": 0
+        }
     });
 
-    // Bounded well under the app's own 30s axios timeout (see
-    // `meter_ocr_fallback_api.ts`) so a slow upstream fails HERE, with a
-    // real JSON error body the app can show, rather than the client giving
-    // up first with no response at all — that's exactly the generic
-    // "Could not reach the cloud reading service" dead end this is meant
-    // to avoid.
+    // Bounded well under the app's own axios timeout so a slow upstream
+    // fails HERE, with a real JSON error body the app can show, rather than
+    // the client giving up first with no response at all.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(25))
         .build()
-        .map_err(|e| ClaudeCallError::Upstream(format!("client build failed: {e}")))?;
+        .map_err(|e| VisionCallError::Upstream(format!("client build failed: {e}")))?;
 
-    let parsed = send_with_retry(&client, &api_key, &body).await?;
+    // API key travels as a query param, per Gemini's REST convention (no
+    // Anthropic-style auth header) — never include `url` itself in any
+    // logged error message below, only `status`/response `text`.
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    );
 
-    if parsed.get("stop_reason").and_then(|v| v.as_str()) == Some("refusal") {
-        return Err(ClaudeCallError::Declined);
+    let parsed = send_with_retry(&client, &url, &body).await?;
+
+    let candidates = parsed.get("candidates").and_then(|c| c.as_array());
+    if candidates.map(|c| c.is_empty()).unwrap_or(true) {
+        // Empty/missing `candidates` — the whole prompt was blocked
+        // (`promptFeedback.blockReason`) before any candidate was produced.
+        return Err(VisionCallError::Declined);
+    }
+    let candidate = &candidates.unwrap()[0];
+
+    let finish_reason = candidate.get("finishReason").and_then(|v| v.as_str());
+    if matches!(finish_reason, Some("SAFETY") | Some("RECITATION")) {
+        return Err(VisionCallError::Declined);
+    }
+    if finish_reason == Some("MAX_TOKENS") {
+        return Err(VisionCallError::SchemaMismatch(
+            "response truncated at MAX_TOKENS before finishing valid JSON".to_string(),
+        ));
     }
 
-    let text = parsed
+    let text = candidate
         .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|blocks| blocks.iter().find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")))
-        .and_then(|b| b.get("text"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .and_then(|parts| parts.first())
+        .and_then(|p| p.get("text"))
         .and_then(|t| t.as_str())
-        .ok_or_else(|| ClaudeCallError::Upstream("no text block in response".to_string()))?;
+        .ok_or_else(|| VisionCallError::SchemaMismatch("no text part in Gemini response".to_string()))?;
 
-    let reading: ClaudeMeterReading = serde_json::from_str(text)
-        .map_err(|e| ClaudeCallError::Upstream(format!("response didn't match schema: {e}")))?;
+    let reading: MeterReadingTokens = serde_json::from_str(text)
+        .map_err(|e| VisionCallError::SchemaMismatch(format!("response didn't match schema: {e}")))?;
 
-    if reading.top_token.trim().is_empty() && reading.bottom_token.trim().is_empty() {
-        return Err(ClaudeCallError::NoTextDetected);
+    if reading.sale_token.trim().is_empty() && reading.liters_token.trim().is_empty() {
+        return Err(VisionCallError::NoTextDetected);
     }
 
     Ok(reading)
 }
 
-/// One retry, short fixed backoff, and ONLY for failures that are plausibly
-/// transient: a network-level error (`Client::send` itself failing —
-/// connect/TLS/timeout) or a 5xx from Anthropic (server-side overload,
-/// gateway hiccup). A 4xx (bad request, auth, invalid image) means retrying
-/// the exact same body would just fail the exact same way, so those return
-/// immediately on the first attempt. This is the whole difference between
-/// "a single flaky call away from the attendant" and "the attendant has to
-/// notice, tap the button again themselves, and hope" — the retry happens
-/// inside the one request the app already made, invisibly.
+/// One retry, and ONLY for failures that are plausibly transient: a
+/// network-level error (`Client::send` itself failing — connect/TLS/
+/// timeout), a 5xx from Gemini (server-side overload, gateway hiccup), or
+/// a 429 (rate limit). A 4xx other than 429 (bad request, auth, invalid
+/// image) means retrying the exact same body would just fail the exact
+/// same way, so those return immediately on the first attempt.
+///
+/// 429 gets a longer backoff than network/5xx: the free-tier quota window
+/// resets per-minute, not per-request, so retrying after the same short
+/// delay used for a transient network hiccup would almost certainly just
+/// fail again against a window that hasn't cleared, burning the one retry
+/// this function budgets for nothing. 5 seconds doesn't guarantee the
+/// window has reset either, but it's a meaningfully better bet than a
+/// sub-second delay against a per-minute limit.
 async fn send_with_retry(
     client: &reqwest::Client,
-    api_key: &str,
+    url: &str,
     body: &serde_json::Value,
-) -> Result<serde_json::Value, ClaudeCallError> {
+) -> Result<serde_json::Value, VisionCallError> {
+    const DEFAULT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(600);
+    const RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut backoff = DEFAULT_BACKOFF;
     let mut last_err = None;
+    let mut last_was_rate_limited = false;
+
     for attempt in 0..2 {
         if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            tokio::time::sleep(backoff).await;
         }
 
-        let sent = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await;
+        let sent = client.post(url).json(body).send().await;
 
         let resp = match sent {
             Ok(resp) => resp,
             Err(e) => {
                 last_err = Some(format!("request failed: {e}"));
+                last_was_rate_limited = false;
+                backoff = DEFAULT_BACKOFF;
                 continue; // network/timeout — worth the one retry
             }
         };
@@ -460,68 +684,92 @@ async fn send_with_retry(
             return resp
                 .json()
                 .await
-                .map_err(|e| ClaudeCallError::Upstream(format!("bad JSON response: {e}")));
+                .map_err(|e| VisionCallError::Upstream(format!("bad JSON response: {e}")));
         }
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+
+        if status.as_u16() == 429 {
+            last_err = Some(format!("HTTP 429: {text}"));
+            last_was_rate_limited = true;
+            backoff = RATE_LIMIT_BACKOFF;
+            continue; // rate limit — worth the one retry, with a longer wait
+        }
+
         if status.is_server_error() {
             last_err = Some(format!("HTTP {status}: {text}"));
+            last_was_rate_limited = false;
+            backoff = DEFAULT_BACKOFF;
             continue; // 5xx — worth the one retry
         }
-        // 4xx — same body would fail the same way again, don't waste the retry.
-        return Err(ClaudeCallError::Upstream(format!("HTTP {status}: {text}")));
+
+        // 4xx other than 429 — same body would fail the same way again,
+        // don't waste the retry.
+        return Err(VisionCallError::Upstream(format!("HTTP {status}: {text}")));
     }
 
-    Err(ClaudeCallError::Upstream(
-        last_err.unwrap_or_else(|| "exhausted retries".to_string()),
-    ))
+    let message = last_err.unwrap_or_else(|| "exhausted retries".to_string());
+    if last_was_rate_limited {
+        Err(VisionCallError::RateLimited(message))
+    } else {
+        Err(VisionCallError::Upstream(message))
+    }
 }
 
 /// Deferred insert into `meter_ocr_fallback_calls` — built once the outcome
 /// is known, written after the response is already assembled so a slow/
 /// failed log write never delays or breaks the actual answer to the app.
-struct FallbackLog {
+/// This table's job is still just cost/cap tracking (see migration 006) —
+/// per-nozzle correctness auditing now lives in `pump_reading_audit`,
+/// written by `/confirm`. The `top_token`/`bottom_token` columns are reused
+/// as-is (not renamed, to avoid an unnecessary extra migration) to hold
+/// `sale_token`/`liters_token` respectively; `expected_mode` is reused to
+/// hold `shift_event` ("open"/"close").
+struct ReadLog {
     company_prefix: String,
     company_url: String,
     site: String,
     device_id: String,
-    expected_mode: String,
+    shift_event: String,
     ok: bool,
     error: Option<String>,
-    top_token: Option<String>,
-    bottom_token: Option<String>,
+    sale_token: Option<String>,
+    liters_token: Option<String>,
     confidence: Option<String>,
+    model: String,
 }
 
-impl FallbackLog {
-    fn succeeded(req: &FallbackRequest, reading: &ClaudeMeterReading) -> Self {
+impl ReadLog {
+    fn succeeded(req: &ReadRequest, reading: &MeterReadingTokens, model: &str) -> Self {
         Self {
             company_prefix: req.company_prefix.clone(),
             company_url: req.company_url.clone(),
             site: req.site.clone(),
             device_id: req.device_id.clone(),
-            expected_mode: req.expected_mode.clone(),
+            shift_event: req.shift_event.clone(),
             ok: true,
             error: None,
-            top_token: Some(reading.top_token.clone()),
-            bottom_token: Some(reading.bottom_token.clone()),
+            sale_token: Some(reading.sale_token.clone()),
+            liters_token: Some(reading.liters_token.clone()),
             confidence: Some(reading.confidence.clone()),
+            model: model.to_string(),
         }
     }
 
-    fn failed(req: &FallbackRequest, error: &str) -> Self {
+    fn failed(req: &ReadRequest, error: &str, model: &str) -> Self {
         Self {
             company_prefix: req.company_prefix.clone(),
             company_url: req.company_url.clone(),
             site: req.site.clone(),
             device_id: req.device_id.clone(),
-            expected_mode: req.expected_mode.clone(),
+            shift_event: req.shift_event.clone(),
             ok: false,
             error: Some(error.to_string()),
-            top_token: None,
-            bottom_token: None,
+            sale_token: None,
+            liters_token: None,
             confidence: None,
+            model: model.to_string(),
         }
     }
 
@@ -538,18 +786,250 @@ impl FallbackLog {
         .bind(&self.company_url)
         .bind(&self.site)
         .bind(&self.device_id)
-        .bind(&self.expected_mode)
+        .bind(&self.shift_event)
         .bind(self.ok)
         .bind(&self.error)
-        .bind(&self.top_token)
-        .bind(&self.bottom_token)
+        .bind(&self.sale_token)
+        .bind(&self.liters_token)
         .bind(&self.confidence)
-        .bind("claude-opus-5")
+        .bind(&self.model)
         .execute(db)
         .await;
 
         if let Err(e) = result {
-            tracing::error!("[METER_OCR] failed to log fallback call: {e}");
+            tracing::error!("[METER_OCR] failed to log read call: {e}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /confirm
+// ---------------------------------------------------------------------------
+
+/// JSON body for `POST /confirm` — no image here, this just records what the
+/// attendant actually went with (possibly after editing the model's read, or
+/// entering everything manually with no cloud read at all, in which case
+/// `raw_model_response` is `None`).
+#[derive(Debug, Deserialize)]
+struct ConfirmRequest {
+    company_prefix: String,
+    company_url: String,
+    #[serde(default)]
+    site: String,
+    pump_id: String,
+    nozzle_id: String,
+    shift_event: String, // "open" | "close"
+    raw_model_response: Option<serde_json::Value>,
+    #[serde(default)]
+    anomaly_flags: Vec<String>,
+    confirmed_sale_number: Option<i64>,
+    confirmed_liters: Option<f64>,
+    confirmed_reading: Option<f64>,
+    #[serde(default)]
+    was_edited: bool,
+    image_ref: Option<String>,
+    attendant_id: Option<String>,
+    /// ISO-8601 string from the client; parsed to `DateTime<Utc>` below, or
+    /// `NOW()` is used at insert time if this is missing/unparseable.
+    timestamp: Option<String>,
+}
+
+async fn meter_ocr_confirm(
+    State(db): State<Arc<PgPool>>,
+    Json(req): Json<ConfirmRequest>,
+) -> impl IntoResponse {
+    if !matches!(req.shift_event.as_str(), "open" | "close") {
+        return bad_request("shift_event must be \"open\" or \"close\"");
+    }
+
+    let client_timestamp: Option<DateTime<Utc>> = req
+        .timestamp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    // `raw_model_response` is the full /read response body passed straight
+    // through by the client — rather than asking the client to re-send
+    // confidence/sale_token/liters_token/needs_review as separate fields
+    // (which would just be a second, driftable copy of the same data), pull
+    // them back out of that JSON blob here for the dedicated audit columns.
+    // All default to NULL/false when there was no model call at all.
+    let (confidence, sale_token, liters_token, needs_review) = match &req.raw_model_response {
+        Some(v) => (
+            v.get("confidence").and_then(|x| x.as_str()).map(str::to_string),
+            v.get("sale_token").and_then(|x| x.as_str()).map(str::to_string),
+            v.get("liters_token").and_then(|x| x.as_str()).map(str::to_string),
+            v.get("needs_review").and_then(|x| x.as_bool()).unwrap_or(false),
+        ),
+        None => (None, None, None, false),
+    };
+
+    let inserted: Result<(i64,), sqlx::Error> = sqlx::query_as(
+        r#"
+        INSERT INTO pump_reading_audit
+            (company_prefix, company_url, site, pump_id, nozzle_id, shift_event,
+             raw_model_response, confidence, sale_token, liters_token, anomaly_flags,
+             needs_review, confirmed_sale_number, confirmed_liters, confirmed_reading,
+             was_edited, image_ref, attendant_id, client_timestamp)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        RETURNING id
+        "#,
+    )
+    .bind(&req.company_prefix)
+    .bind(&req.company_url)
+    .bind(&req.site)
+    .bind(&req.pump_id)
+    .bind(&req.nozzle_id)
+    .bind(&req.shift_event)
+    .bind(&req.raw_model_response)
+    .bind(&confidence)
+    .bind(&sale_token)
+    .bind(&liters_token)
+    .bind(&req.anomaly_flags)
+    .bind(needs_review)
+    .bind(req.confirmed_sale_number)
+    .bind(req.confirmed_liters)
+    .bind(req.confirmed_reading)
+    .bind(req.was_edited)
+    .bind(&req.image_ref)
+    .bind(&req.attendant_id)
+    .bind(client_timestamp)
+    .fetch_one(db.as_ref())
+    .await;
+
+    let audit_id = match inserted {
+        Ok((id,)) => id,
+        Err(e) => {
+            tracing::error!("[METER_OCR] confirm audit insert failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "database_error",
+                    "message": "Could not record the confirmed reading — try again.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Only clobber the "last known" state with fields the attendant actually
+    // confirmed — COALESCE against the existing row so a confirm submitted
+    // with a null sale/liters value (shouldn't normally happen, but the
+    // client could in theory send one) can't wipe out a good baseline.
+    let upserted = sqlx::query(
+        r#"
+        INSERT INTO pump_reading_state
+            (company_prefix, company_url, site, pump_id, nozzle_id,
+             last_liters, last_sale_number, last_confirmed_at, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8, NOW()),NOW())
+        ON CONFLICT (company_prefix, company_url, site, pump_id, nozzle_id)
+        DO UPDATE SET
+            last_liters = COALESCE(EXCLUDED.last_liters, pump_reading_state.last_liters),
+            last_sale_number = COALESCE(EXCLUDED.last_sale_number, pump_reading_state.last_sale_number),
+            last_confirmed_at = COALESCE(EXCLUDED.last_confirmed_at, pump_reading_state.last_confirmed_at),
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&req.company_prefix)
+    .bind(&req.company_url)
+    .bind(&req.site)
+    .bind(&req.pump_id)
+    .bind(&req.nozzle_id)
+    .bind(req.confirmed_liters)
+    .bind(req.confirmed_sale_number)
+    .bind(client_timestamp)
+    .execute(db.as_ref())
+    .await;
+
+    if let Err(e) = upserted {
+        // The audit row is already safely written — that's the durable
+        // record — so a failure updating the "last known" cache is logged
+        // but not surfaced as a failure to the attendant, who has already
+        // done their job correctly.
+        tracing::error!("[METER_OCR] pump_reading_state upsert failed: {e}");
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "audit_id": audit_id })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sale_token_drops_leading_zeros() {
+        assert_eq!(parse_sale_token("0009"), Some(9));
+        assert_eq!(parse_sale_token("00012"), Some(12));
+        assert_eq!(parse_sale_token("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_sale_token_empty_or_unparseable_is_none() {
+        assert_eq!(parse_sale_token(""), None);
+        assert_eq!(parse_sale_token("   "), None);
+        assert_eq!(parse_sale_token("abc"), None);
+    }
+
+    #[test]
+    fn parse_liters_token_parses_decimal() {
+        assert_eq!(parse_liters_token("7530.22"), Some(7530.22));
+        assert_eq!(parse_liters_token("0050.00"), Some(50.0));
+    }
+
+    #[test]
+    fn parse_liters_token_empty_is_none() {
+        assert_eq!(parse_liters_token(""), None);
+    }
+
+    #[test]
+    fn compute_reading_pastes_only_the_last_digit_of_sale_token() {
+        // Spec example: counter "00012", liters "4567.89" -> "24567.89",
+        // NOT "124567.89" (the whole-counter bug this fix replaces).
+        let liters = parse_liters_token("4567.89");
+        assert_eq!(compute_reading(liters, "00012", "4567.89"), Some(24567.89));
+    }
+
+    #[test]
+    fn compute_reading_multi_digit_counter_uses_last_digit_not_whole_number() {
+        // The old (buggy) whole-integer paste would have produced
+        // 1234567.89 here.
+        let liters = parse_liters_token("4567.89");
+        assert_eq!(compute_reading(liters, "123", "4567.89"), Some(34567.89));
+    }
+
+    #[test]
+    fn compute_reading_single_digit_counter_is_unaffected_by_the_fix() {
+        let liters = parse_liters_token("7530.22");
+        assert_eq!(compute_reading(liters, "0009", "7530.22"), Some(97530.22));
+        assert_eq!(compute_reading(liters, "9", "7530.22"), Some(97530.22));
+    }
+
+    #[test]
+    fn compute_reading_zero_counter() {
+        let liters = parse_liters_token("1234.56");
+        assert_eq!(compute_reading(liters, "0", "1234.56"), Some(1234.56));
+    }
+
+    #[test]
+    fn compute_reading_none_when_liters_missing() {
+        assert_eq!(compute_reading(None, "9", ""), None);
+    }
+
+    #[test]
+    fn compute_reading_none_when_sale_token_empty_or_unparseable() {
+        let liters = parse_liters_token("6252.95");
+        assert_eq!(compute_reading(liters, "", "6252.95"), None);
+        assert_eq!(compute_reading(liters, "abc", "6252.95"), None);
     }
 }
