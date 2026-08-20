@@ -43,12 +43,12 @@ const DEFAULT_SALE_NUMBER_ROLLOVER_CEILING: i64 = 99999;
 /// as a user for any device-facing endpoint on this service):
 ///
 /// - `POST /read` sends a meter photo and gets back a structured reading.
-///   Every call costs real money (a Gemini API call), so — like the
+///   Every call costs real money (an OpenAI API call), so — like the
 ///   `/fallback` endpoint this replaces — it validates the caller's
 ///   (company_url, company_prefix) against the `companies` directory and
 ///   enforces a per-company daily cap before spending anything.
 /// - `POST /confirm` sends the attendant's final confirmed numbers (no
-///   image, no Gemini call) so we can update the "last known reading"
+///   image, no OpenAI call) so we can update the "last known reading"
 ///   used for next time's anomaly checks and keep a permanent audit trail.
 ///
 /// The old single `/fallback` endpoint (occasional manual escape hatch when
@@ -192,8 +192,8 @@ async fn meter_ocr_read(
     .unwrap_or(None);
     let (last_liters, last_sale_number) = last_state.unwrap_or((None, None));
 
-    let model = resolve_gemini_model();
-    let outcome = call_gemini(&req, &model).await;
+    let model = resolve_openai_model();
+    let outcome = call_openai(&req, &model).await;
 
     let (status, body, log) = match &outcome {
         Ok(reading) => {
@@ -257,8 +257,24 @@ async fn meter_ocr_read(
                 ReadLog::succeeded(&req, reading, &model),
             )
         }
+        // NOTE: these three failure arms deliberately return 200 rather than
+        // a 5xx/502 — Cloudflare (and most CDNs/reverse proxies fronting
+        // this host) silently REPLACES the response body for 502/503/504
+        // with its own generic "error code: 502" plain-text page, even when
+        // the origin already sent a well-formed JSON error. That stripped
+        // every one of these `message` fields in production and made a
+        // handled vision-call failure (bad model output, OpenAI hiccup,
+        // etc.) indistinguishable from the app being unreachable — the
+        // client's axios wrapper falls back to "Could not reach the meter
+        // reading service" whenever `response.data.message` is missing,
+        // which is exactly what a Cloudflare-mangled 502 body produces. The
+        // client already keys off `success`/`error` in the body, not the
+        // HTTP status, so 200 here loses nothing and stops the CDN from
+        // eating the message. Verified live: an identical request with no
+        // `image` field (a genuine 400) passes through Cloudflare with its
+        // JSON body intact — only the 502 range gets swallowed.
         Err(VisionCallError::Declined) => (
-            StatusCode::BAD_GATEWAY,
+            StatusCode::OK,
             serde_json::json!({
                 "success": false,
                 "error": "declined",
@@ -267,7 +283,7 @@ async fn meter_ocr_read(
             ReadLog::failed(&req, "declined", &model),
         ),
         Err(VisionCallError::NoTextDetected) => (
-            StatusCode::BAD_GATEWAY,
+            StatusCode::OK,
             serde_json::json!({
                 "success": false,
                 "error": "no_text_detected",
@@ -276,7 +292,7 @@ async fn meter_ocr_read(
             ReadLog::failed(&req, "no_text_detected", &model),
         ),
         Err(VisionCallError::RateLimited(msg)) => {
-            tracing::error!("[METER_OCR] Gemini call rate-limited: {msg}");
+            tracing::error!("[METER_OCR] OpenAI call rate-limited: {msg}");
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 serde_json::json!({
@@ -288,9 +304,9 @@ async fn meter_ocr_read(
             )
         }
         Err(VisionCallError::SchemaMismatch(msg)) | Err(VisionCallError::Upstream(msg)) => {
-            tracing::error!("[METER_OCR] Gemini call failed: {msg}");
+            tracing::error!("[METER_OCR] OpenAI call failed: {msg}");
             (
-                StatusCode::BAD_GATEWAY,
+                StatusCode::OK,
                 serde_json::json!({
                     "success": false,
                     "error": "upstream_error",
@@ -466,14 +482,13 @@ fn sale_number_regression(sale_number: i64, last_sale_number: i64, rollover_ceil
 }
 
 // ---------------------------------------------------------------------------
-// Gemini call
+// OpenAI call
 // ---------------------------------------------------------------------------
 
 enum VisionCallError {
-    /// The model declined to produce a reading — Gemini's equivalent of a
-    /// safety refusal: an empty `candidates` array (the whole prompt was
-    /// blocked, see `promptFeedback.blockReason`) or a candidate whose own
-    /// `finishReason` is `SAFETY`/`RECITATION`. Vanishingly unlikely for a
+    /// The model declined to produce a reading — a non-null/non-empty
+    /// `message.refusal` (structured-outputs refusal) or
+    /// `finish_reason: "content_filter"`. Vanishingly unlikely for a
     /// pump-display photo, but worth its own branch rather than an assumed-
     /// successful response.
     Declined,
@@ -482,51 +497,53 @@ enum VisionCallError {
     NoTextDetected,
     /// A 200 response whose JSON text didn't parse/validate into
     /// `MeterReadingTokens` — including a response cut off by
-    /// `finishReason: "MAX_TOKENS"` before it finished writing valid JSON.
-    /// Kept distinct from `Upstream` so `call_gemini` can retry ONLY this
+    /// `finish_reason: "length"` before it finished writing valid JSON.
+    /// Kept distinct from `Upstream` so `call_openai` can retry ONLY this
     /// failure mode once, same image, per spec — a network/5xx/429 failure
     /// already gets its own retry inside `send_with_retry`, and this is a
     /// separate, outer retry layer on top of that for "the call succeeded
     /// but the payload was junk".
     SchemaMismatch(String),
-    /// HTTP 429 from Gemini, surviving `send_with_retry`'s own one retry
+    /// HTTP 429 from OpenAI, surviving `send_with_retry`'s own one retry
     /// (with a longer, rate-limit-appropriate backoff — see that
     /// function). Kept distinct from `Upstream` so the app can tell the
     /// attendant "the service is busy, try again shortly" instead of a
     /// generic failure message — a meaningfully different, and likely
     /// self-resolving, situation compared to an actual outage.
     RateLimited(String),
-    /// Network/HTTP failure talking to the Gemini API, or a non-2xx
+    /// Network/HTTP failure talking to the OpenAI API, or a non-2xx
     /// response that isn't one of the above. Carries a short message for
     /// the server log only — never echoed to the client.
     Upstream(String),
 }
 
-/// `GEMINI_MODEL` lets ops swap models via `.env` alone (no redeploy)
-/// if/when Google renames or deprecates the default — model availability
-/// under this API has moved fast enough that hardcoding one string here
-/// would likely be the first thing to go stale.
-fn resolve_gemini_model() -> String {
-    std::env::var("GEMINI_MODEL")
+/// `OPENAI_MODEL` lets ops swap models via `.env` alone (no redeploy) if
+/// OpenAI renames/deprecates the default — model availability under this
+/// API has moved fast enough that hardcoding one string here would likely
+/// be the first thing to go stale. Defaults to GPT-4o, a widely available
+/// vision-capable model with structured-outputs support; swap in whatever
+/// current-generation vision model you actually want to run this on.
+fn resolve_openai_model() -> String {
+    std::env::var("OPENAI_MODEL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "gemini-2.5-flash".to_string())
+        .unwrap_or_else(|| "gpt-4o".to_string())
 }
 
-/// Wraps `call_gemini_once` with exactly one extra retry, and ONLY for
+/// Wraps `call_openai_once` with exactly one extra retry, and ONLY for
 /// `SchemaMismatch` — see that variant's doc comment. Network/5xx/429
 /// retries are already handled one layer down inside `send_with_retry`, so
 /// this is deliberately not a generic "retry everything" loop.
-async fn call_gemini(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
-    match call_gemini_once(req, model).await {
-        Err(VisionCallError::SchemaMismatch(_)) => call_gemini_once(req, model).await,
+async fn call_openai(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
+    match call_openai_once(req, model).await {
+        Err(VisionCallError::SchemaMismatch(_)) => call_openai_once(req, model).await,
         other => other,
     }
 }
 
-async fn call_gemini_once(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .map_err(|_| VisionCallError::Upstream("GEMINI_API_KEY not set".to_string()))?;
+async fn call_openai_once(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| VisionCallError::Upstream("OPENAI_API_KEY not set".to_string()))?;
 
     let image_b64 = STANDARD.encode(&req.image_bytes);
 
@@ -548,39 +565,45 @@ to note which digit(s) and which row were ambiguous — do not silently guess an
 confidence.".to_string();
 
     let body = serde_json::json!({
-        "contents": [{
-            "parts": [
+        "model": model,
+        // Bounded generously enough that structured-output JSON never gets
+        // cut off mid-write; digit-reading is a short, scoped answer, so
+        // this is pure headroom, not an expected spend.
+        "max_completion_tokens": 4096,
+        // Digit-reading has no upside from sampling variety — pin it to 0
+        // rather than leave it at a default that invites read-to-read
+        // variance on the same photo.
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "meter_reading",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "sale_token": { "type": "string" },
+                        "liters_token": { "type": "string" },
+                        "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+                        "uncertain_digits": { "type": "string" }
+                    },
+                    "required": ["sale_token", "liters_token", "confidence", "uncertain_digits"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
                 {
-                    "inline_data": {
-                        "mime_type": req.image_media_type,
-                        "data": image_b64,
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", req.image_media_type, image_b64)
                     }
-                },
-                { "text": prompt }
+                }
             ]
-        }],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            // Gemini's schema dialect is an OpenAPI-3.0 subset — uppercase
-            // type names, no "additionalProperties" support — rather than
-            // plain JSON Schema, but the same 4 required fields as before.
-            "response_schema": {
-                "type": "OBJECT",
-                "properties": {
-                    "sale_token": { "type": "STRING" },
-                    "liters_token": { "type": "STRING" },
-                    "confidence": { "type": "STRING", "enum": ["high", "medium", "low"] },
-                    "uncertain_digits": { "type": "STRING" }
-                },
-                "required": ["sale_token", "liters_token", "confidence", "uncertain_digits"]
-            },
-            // Digit-reading has no upside from sampling variety. Claude
-            // Opus 5 relied on structured output alone for determinism
-            // (it had removed temperature entirely); Gemini still exposes
-            // it, so pin it to 0 rather than leave it at a default that
-            // invites read-to-read variance on the same photo.
-            "temperature": 0
-        }
+        }]
     });
 
     // Bounded well under the app's own axios timeout so a slow upstream
@@ -591,41 +614,30 @@ confidence.".to_string();
         .build()
         .map_err(|e| VisionCallError::Upstream(format!("client build failed: {e}")))?;
 
-    // API key travels as a query param, per Gemini's REST convention (no
-    // Anthropic-style auth header) — never include `url` itself in any
-    // logged error message below, only `status`/response `text`.
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    );
+    let parsed = send_with_retry(&client, &api_key, &body).await?;
 
-    let parsed = send_with_retry(&client, &url, &body).await?;
+    let choice = parsed.get("choices").and_then(|c| c.as_array()).and_then(|arr| arr.first());
+    let message = choice.and_then(|c| c.get("message"));
+    let finish_reason = choice.and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str());
 
-    let candidates = parsed.get("candidates").and_then(|c| c.as_array());
-    if candidates.map(|c| c.is_empty()).unwrap_or(true) {
-        // Empty/missing `candidates` — the whole prompt was blocked
-        // (`promptFeedback.blockReason`) before any candidate was produced.
+    let refused = message
+        .and_then(|m| m.get("refusal"))
+        .and_then(|r| r.as_str())
+        .map(|r| !r.trim().is_empty())
+        .unwrap_or(false);
+    if refused || finish_reason == Some("content_filter") {
         return Err(VisionCallError::Declined);
     }
-    let candidate = &candidates.unwrap()[0];
-
-    let finish_reason = candidate.get("finishReason").and_then(|v| v.as_str());
-    if matches!(finish_reason, Some("SAFETY") | Some("RECITATION")) {
-        return Err(VisionCallError::Declined);
-    }
-    if finish_reason == Some("MAX_TOKENS") {
+    if finish_reason == Some("length") {
         return Err(VisionCallError::SchemaMismatch(
-            "response truncated at MAX_TOKENS before finishing valid JSON".to_string(),
+            "response truncated at max_completion_tokens before finishing valid JSON".to_string(),
         ));
     }
 
-    let text = candidate
-        .get("content")
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-        .and_then(|parts| parts.first())
-        .and_then(|p| p.get("text"))
+    let text = message
+        .and_then(|m| m.get("content"))
         .and_then(|t| t.as_str())
-        .ok_or_else(|| VisionCallError::SchemaMismatch("no text part in Gemini response".to_string()))?;
+        .ok_or_else(|| VisionCallError::SchemaMismatch("no message content in OpenAI response".to_string()))?;
 
     let reading: MeterReadingTokens = serde_json::from_str(text)
         .map_err(|e| VisionCallError::SchemaMismatch(format!("response didn't match schema: {e}")))?;
@@ -639,21 +651,21 @@ confidence.".to_string();
 
 /// One retry, and ONLY for failures that are plausibly transient: a
 /// network-level error (`Client::send` itself failing — connect/TLS/
-/// timeout), a 5xx from Gemini (server-side overload, gateway hiccup), or
+/// timeout), a 5xx from OpenAI (server-side overload, gateway hiccup), or
 /// a 429 (rate limit). A 4xx other than 429 (bad request, auth, invalid
 /// image) means retrying the exact same body would just fail the exact
 /// same way, so those return immediately on the first attempt.
 ///
-/// 429 gets a longer backoff than network/5xx: the free-tier quota window
-/// resets per-minute, not per-request, so retrying after the same short
-/// delay used for a transient network hiccup would almost certainly just
-/// fail again against a window that hasn't cleared, burning the one retry
-/// this function budgets for nothing. 5 seconds doesn't guarantee the
-/// window has reset either, but it's a meaningfully better bet than a
-/// sub-second delay against a per-minute limit.
+/// 429 gets a longer backoff than network/5xx: the rate-limit window resets
+/// per-minute, not per-request, so retrying after the same short delay used
+/// for a transient network hiccup would almost certainly just fail again
+/// against a window that hasn't cleared, burning the one retry this
+/// function budgets for nothing. 5 seconds doesn't guarantee the window has
+/// reset either, but it's a meaningfully better bet than a sub-second delay
+/// against a per-minute limit.
 async fn send_with_retry(
     client: &reqwest::Client,
-    url: &str,
+    api_key: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, VisionCallError> {
     const DEFAULT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(600);
@@ -668,7 +680,13 @@ async fn send_with_retry(
             tokio::time::sleep(backoff).await;
         }
 
-        let sent = client.post(url).json(body).send().await;
+        let sent = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await;
 
         let resp = match sent {
             Ok(resp) => resp,

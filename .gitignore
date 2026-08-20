@@ -1,2 +1,5 @@
 /target*
 /target
+
+# Real secrets (OpenAI/DB/JWT) live here — never commit this file.
+.env
