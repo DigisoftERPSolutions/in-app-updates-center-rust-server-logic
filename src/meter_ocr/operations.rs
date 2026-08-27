@@ -43,12 +43,12 @@ const DEFAULT_SALE_NUMBER_ROLLOVER_CEILING: i64 = 99999;
 /// as a user for any device-facing endpoint on this service):
 ///
 /// - `POST /read` sends a meter photo and gets back a structured reading.
-///   Every call costs real money (an OpenAI API call), so — like the
+///   Every call costs real money (a Gemini API call), so — like the
 ///   `/fallback` endpoint this replaces — it validates the caller's
 ///   (company_url, company_prefix) against the `companies` directory and
 ///   enforces a per-company daily cap before spending anything.
 /// - `POST /confirm` sends the attendant's final confirmed numbers (no
-///   image, no OpenAI call) so we can update the "last known reading"
+///   image, no Gemini call) so we can update the "last known reading"
 ///   used for next time's anomaly checks and keep a permanent audit trail.
 ///
 /// The old single `/fallback` endpoint (occasional manual escape hatch when
@@ -192,8 +192,8 @@ async fn meter_ocr_read(
     .unwrap_or(None);
     let (last_liters, last_sale_number) = last_state.unwrap_or((None, None));
 
-    let model = resolve_openai_model();
-    let outcome = call_openai(&req, &model).await;
+    let model = resolve_gemini_model();
+    let outcome = call_gemini(&req, &model).await;
 
     let (status, body, log) = match &outcome {
         Ok(reading) => {
@@ -263,7 +263,7 @@ async fn meter_ocr_read(
         // with its own generic "error code: 502" plain-text page, even when
         // the origin already sent a well-formed JSON error. That stripped
         // every one of these `message` fields in production and made a
-        // handled vision-call failure (bad model output, OpenAI hiccup,
+        // handled vision-call failure (bad model output, Gemini hiccup,
         // etc.) indistinguishable from the app being unreachable — the
         // client's axios wrapper falls back to "Could not reach the meter
         // reading service" whenever `response.data.message` is missing,
@@ -292,7 +292,7 @@ async fn meter_ocr_read(
             ReadLog::failed(&req, "no_text_detected", &model),
         ),
         Err(VisionCallError::RateLimited(msg)) => {
-            tracing::error!("[METER_OCR] OpenAI call rate-limited: {msg}");
+            tracing::error!("[METER_OCR] Gemini call rate-limited: {msg}");
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 serde_json::json!({
@@ -304,7 +304,7 @@ async fn meter_ocr_read(
             )
         }
         Err(VisionCallError::SchemaMismatch(msg)) | Err(VisionCallError::Upstream(msg)) => {
-            tracing::error!("[METER_OCR] OpenAI call failed: {msg}");
+            tracing::error!("[METER_OCR] Gemini call failed: {msg}");
             (
                 StatusCode::OK,
                 serde_json::json!({
@@ -407,9 +407,18 @@ async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String
 // ---------------------------------------------------------------------------
 
 /// Leading zeros are fine — integer parsing just drops them, which is
-/// exactly the value we want (`"0009"` -> `9`).
+/// exactly the value we want (`"0009"` -> `9`). Also strips any leading
+/// non-digit run before parsing — seen in practice on displays where the
+/// "LL" label sits with no visual gap before the counter (e.g. "LL00001"):
+/// the model sometimes echoes the label back as part of sale_token instead
+/// of just the digits, and since the label is never numeric there's no
+/// ambiguity in dropping it. Without this, a labeled token failed
+/// `.parse::<i64>()` outright and silently produced `sale_number: None` —
+/// this fix belongs here rather than only in the prompt because the model
+/// output is exactly the kind of thing this file's parsing layer already
+/// exists to not have to trust.
 fn parse_sale_token(token: &str) -> Option<i64> {
-    let t = token.trim();
+    let t = token.trim().trim_start_matches(|c: char| !c.is_ascii_digit());
     if t.is_empty() {
         None
     } else {
@@ -482,13 +491,14 @@ fn sale_number_regression(sale_number: i64, last_sale_number: i64, rollover_ceil
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI call
+// Gemini call
 // ---------------------------------------------------------------------------
 
 enum VisionCallError {
-    /// The model declined to produce a reading — a non-null/non-empty
-    /// `message.refusal` (structured-outputs refusal) or
-    /// `finish_reason: "content_filter"`. Vanishingly unlikely for a
+    /// The model declined to produce a reading — Gemini's equivalent of a
+    /// safety refusal: an empty `candidates` array (the whole prompt was
+    /// blocked, see `promptFeedback.blockReason`) or a candidate whose own
+    /// `finishReason` is `SAFETY`/`RECITATION`. Vanishingly unlikely for a
     /// pump-display photo, but worth its own branch rather than an assumed-
     /// successful response.
     Declined,
@@ -497,53 +507,54 @@ enum VisionCallError {
     NoTextDetected,
     /// A 200 response whose JSON text didn't parse/validate into
     /// `MeterReadingTokens` — including a response cut off by
-    /// `finish_reason: "length"` before it finished writing valid JSON.
-    /// Kept distinct from `Upstream` so `call_openai` can retry ONLY this
+    /// `finishReason: "MAX_TOKENS"` before it finished writing valid JSON.
+    /// Kept distinct from `Upstream` so `call_gemini` can retry ONLY this
     /// failure mode once, same image, per spec — a network/5xx/429 failure
     /// already gets its own retry inside `send_with_retry`, and this is a
     /// separate, outer retry layer on top of that for "the call succeeded
     /// but the payload was junk".
     SchemaMismatch(String),
-    /// HTTP 429 from OpenAI, surviving `send_with_retry`'s own one retry
+    /// HTTP 429 from Gemini, surviving `send_with_retry`'s own one retry
     /// (with a longer, rate-limit-appropriate backoff — see that
     /// function). Kept distinct from `Upstream` so the app can tell the
     /// attendant "the service is busy, try again shortly" instead of a
     /// generic failure message — a meaningfully different, and likely
     /// self-resolving, situation compared to an actual outage.
     RateLimited(String),
-    /// Network/HTTP failure talking to the OpenAI API, or a non-2xx
+    /// Network/HTTP failure talking to the Gemini API, or a non-2xx
     /// response that isn't one of the above. Carries a short message for
     /// the server log only — never echoed to the client.
     Upstream(String),
 }
 
-/// `OPENAI_MODEL` lets ops swap models via `.env` alone (no redeploy) if
-/// OpenAI renames/deprecates the default — model availability under this
-/// API has moved fast enough that hardcoding one string here would likely
-/// be the first thing to go stale. Defaults to GPT-4o, a widely available
-/// vision-capable model with structured-outputs support; swap in whatever
-/// current-generation vision model you actually want to run this on.
-fn resolve_openai_model() -> String {
-    std::env::var("OPENAI_MODEL")
+/// `GEMINI_MODEL` lets ops swap models via `.env` alone (no redeploy) if/when
+/// Google renames or deprecates the default — model availability under this
+/// API has moved fast enough that hardcoding one string here would likely be
+/// the first thing to go stale. Defaults to Gemini 3.5 Flash, a
+/// vision-capable model with structured-output support; swap in whatever
+/// current-generation vision model you actually want to run this on. (The
+/// prior default, gemini-2.5-flash, retires 2026-10-16 — don't revert to it.)
+fn resolve_gemini_model() -> String {
+    std::env::var("GEMINI_MODEL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "gpt-4o".to_string())
+        .unwrap_or_else(|| "gemini-3.5-flash".to_string())
 }
 
-/// Wraps `call_openai_once` with exactly one extra retry, and ONLY for
+/// Wraps `call_gemini_once` with exactly one extra retry, and ONLY for
 /// `SchemaMismatch` — see that variant's doc comment. Network/5xx/429
 /// retries are already handled one layer down inside `send_with_retry`, so
 /// this is deliberately not a generic "retry everything" loop.
-async fn call_openai(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
-    match call_openai_once(req, model).await {
-        Err(VisionCallError::SchemaMismatch(_)) => call_openai_once(req, model).await,
+async fn call_gemini(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
+    match call_gemini_once(req, model).await {
+        Err(VisionCallError::SchemaMismatch(_)) => call_gemini_once(req, model).await,
         other => other,
     }
 }
 
-async fn call_openai_once(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| VisionCallError::Upstream("OPENAI_API_KEY not set".to_string()))?;
+async fn call_gemini_once(req: &ReadRequest, model: &str) -> Result<MeterReadingTokens, VisionCallError> {
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| VisionCallError::Upstream("GEMINI_API_KEY not set".to_string()))?;
 
     let image_b64 = STANDARD.encode(&req.image_bytes);
 
@@ -558,52 +569,51 @@ viewed at an angle, or has glare on it. Reason about each digit's individual sha
 deciding what it is, rather than pattern-matching the row as a whole.\n\n\
 Return sale_token and liters_token as the EXACT digit strings shown on the display, not as \
 parsed or re-formatted numbers — preserve leading zeros in sale_token, and preserve the decimal \
-point exactly where it's lit in liters_token. If a row is genuinely illegible after careful \
-reasoning, return an empty string for that token rather than guessing at a plausible value.\n\n\
+point exactly where it's lit in liters_token. Do NOT include the \"LL\" label itself in \
+sale_token, even on displays where the label sits with no visible gap before the counter digits \
+(e.g. a display reading \"LL00001\" has sale_token \"00001\", not \"LL00001\") — sale_token is the \
+counter value only. If a row is genuinely illegible after careful reasoning, return an empty \
+string for that token rather than guessing at a plausible value.\n\n\
 If there is genuine doubt about any digit, set confidence to \"low\" and use uncertain_digits \
 to note which digit(s) and which row were ambiguous — do not silently guess and report high \
 confidence.".to_string();
 
     let body = serde_json::json!({
-        "model": model,
-        // Bounded generously enough that structured-output JSON never gets
-        // cut off mid-write; digit-reading is a short, scoped answer, so
-        // this is pure headroom, not an expected spend.
-        "max_completion_tokens": 4096,
-        // Digit-reading has no upside from sampling variety — pin it to 0
-        // rather than leave it at a default that invites read-to-read
-        // variance on the same photo.
-        "temperature": 0,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "meter_reading",
-                "strict": true,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "sale_token": { "type": "string" },
-                        "liters_token": { "type": "string" },
-                        "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
-                        "uncertain_digits": { "type": "string" }
-                    },
-                    "required": ["sale_token", "liters_token", "confidence", "uncertain_digits"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        "messages": [{
-            "role": "user",
-            "content": [
-                { "type": "text", "text": prompt },
+        "contents": [{
+            "parts": [
                 {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": format!("data:{};base64,{}", req.image_media_type, image_b64)
+                    "inline_data": {
+                        "mime_type": req.image_media_type,
+                        "data": image_b64,
                     }
-                }
+                },
+                { "text": prompt }
             ]
-        }]
+        }],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            // Gemini's schema dialect is an OpenAPI-3.0 subset — uppercase
+            // type names, no "additionalProperties" support — rather than
+            // plain JSON Schema.
+            "response_schema": {
+                "type": "OBJECT",
+                "properties": {
+                    "sale_token": { "type": "STRING" },
+                    "liters_token": { "type": "STRING" },
+                    "confidence": { "type": "STRING", "enum": ["high", "medium", "low"] },
+                    "uncertain_digits": { "type": "STRING" }
+                },
+                "required": ["sale_token", "liters_token", "confidence", "uncertain_digits"]
+            },
+            // Digit-reading has no upside from sampling variety — pin it to
+            // 0 rather than leave it at a default that invites read-to-read
+            // variance on the same photo.
+            "temperature": 0,
+            // Bounded generously enough that structured-output JSON never
+            // gets cut off mid-write; digit-reading is a short, scoped
+            // answer, so this is pure headroom, not an expected spend.
+            "maxOutputTokens": 4096
+        }
     });
 
     // Bounded well under the app's own axios timeout so a slow upstream
@@ -614,30 +624,41 @@ confidence.".to_string();
         .build()
         .map_err(|e| VisionCallError::Upstream(format!("client build failed: {e}")))?;
 
-    let parsed = send_with_retry(&client, &api_key, &body).await?;
+    // API key travels as a query param, per Gemini's REST convention (no
+    // auth header) — never include `url` itself in any logged error message
+    // below, only `status`/response `text`.
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    );
 
-    let choice = parsed.get("choices").and_then(|c| c.as_array()).and_then(|arr| arr.first());
-    let message = choice.and_then(|c| c.get("message"));
-    let finish_reason = choice.and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str());
+    let parsed = send_with_retry(&client, &url, &body).await?;
 
-    let refused = message
-        .and_then(|m| m.get("refusal"))
-        .and_then(|r| r.as_str())
-        .map(|r| !r.trim().is_empty())
-        .unwrap_or(false);
-    if refused || finish_reason == Some("content_filter") {
+    let candidates = parsed.get("candidates").and_then(|c| c.as_array());
+    if candidates.map(|c| c.is_empty()).unwrap_or(true) {
+        // Empty/missing `candidates` — the whole prompt was blocked
+        // (`promptFeedback.blockReason`) before any candidate was produced.
         return Err(VisionCallError::Declined);
     }
-    if finish_reason == Some("length") {
+    let candidate = &candidates.unwrap()[0];
+
+    let finish_reason = candidate.get("finishReason").and_then(|v| v.as_str());
+    if matches!(finish_reason, Some("SAFETY") | Some("RECITATION")) {
+        return Err(VisionCallError::Declined);
+    }
+    if finish_reason == Some("MAX_TOKENS") {
         return Err(VisionCallError::SchemaMismatch(
-            "response truncated at max_completion_tokens before finishing valid JSON".to_string(),
+            "response truncated at MAX_TOKENS before finishing valid JSON".to_string(),
         ));
     }
 
-    let text = message
-        .and_then(|m| m.get("content"))
+    let text = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .and_then(|parts| parts.first())
+        .and_then(|p| p.get("text"))
         .and_then(|t| t.as_str())
-        .ok_or_else(|| VisionCallError::SchemaMismatch("no message content in OpenAI response".to_string()))?;
+        .ok_or_else(|| VisionCallError::SchemaMismatch("no text part in Gemini response".to_string()))?;
 
     let reading: MeterReadingTokens = serde_json::from_str(text)
         .map_err(|e| VisionCallError::SchemaMismatch(format!("response didn't match schema: {e}")))?;
@@ -651,12 +672,12 @@ confidence.".to_string();
 
 /// One retry, and ONLY for failures that are plausibly transient: a
 /// network-level error (`Client::send` itself failing — connect/TLS/
-/// timeout), a 5xx from OpenAI (server-side overload, gateway hiccup), or
+/// timeout), a 5xx from Gemini (server-side overload, gateway hiccup), or
 /// a 429 (rate limit). A 4xx other than 429 (bad request, auth, invalid
 /// image) means retrying the exact same body would just fail the exact
 /// same way, so those return immediately on the first attempt.
 ///
-/// 429 gets a longer backoff than network/5xx: the rate-limit window resets
+/// 429 gets a longer backoff than network/5xx: the quota window resets
 /// per-minute, not per-request, so retrying after the same short delay used
 /// for a transient network hiccup would almost certainly just fail again
 /// against a window that hasn't cleared, burning the one retry this
@@ -665,7 +686,7 @@ confidence.".to_string();
 /// against a per-minute limit.
 async fn send_with_retry(
     client: &reqwest::Client,
-    api_key: &str,
+    url: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, VisionCallError> {
     const DEFAULT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(600);
@@ -680,13 +701,7 @@ async fn send_with_retry(
             tokio::time::sleep(backoff).await;
         }
 
-        let sent = client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await;
+        let sent = client.post(url).json(body).send().await;
 
         let resp = match sent {
             Ok(resp) => resp,
@@ -984,6 +999,15 @@ async fn meter_ocr_confirm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_sale_token_strips_a_leading_ll_label() {
+        // Real-world capture: a display with no visual gap between the "LL"
+        // label and the counter came back from the model as "LL00001"
+        // instead of "00001".
+        assert_eq!(parse_sale_token("LL00001"), Some(1));
+        assert_eq!(parse_sale_token("LL9"), Some(9));
+    }
 
     #[test]
     fn parse_sale_token_drops_leading_zeros() {
