@@ -199,7 +199,7 @@ async fn meter_ocr_read(
         Ok(reading) => {
             let sale_number = parse_sale_token(&reading.sale_token);
             let liters = parse_liters_token(&reading.liters_token);
-            let reading_value = compute_reading(liters, &reading.sale_token, &reading.liters_token);
+            let reading_value = compute_reading(liters, sale_number, &reading.liters_token);
 
             let mut anomalies: Vec<String> = Vec::new();
 
@@ -435,31 +435,30 @@ fn parse_liters_token(token: &str) -> Option<f64> {
     }
 }
 
-/// Pastes only the LAST digit of the SALE ("LL") counter row in front of
-/// the exact LITERS token, then parses that as one number — e.g. SALE
-/// "00012", LITERS "4567.89" -> "2" + "4567.89" -> `24567.89`, NOT
-/// `124567.89`. It's the last digit only, not the whole parsed counter:
-/// the SALE register overflows past its own display width every ~10
-/// units, so LITERS's own leading digit is exactly what that overflow
-/// would have carried into — anything in SALE beyond the ones digit is
-/// redundant with what LITERS already shows correctly on its own. Pasting
-/// the whole counter (e.g. "12") would double-count that overflow and
-/// produce a reading with extra leading digits.
+/// Pastes the WHOLE parsed SALE ("LL") counter (leading zeros stripped) in
+/// front of the exact LITERS token, then parses that as one number — e.g.
+/// SALE "0017", LITERS "7680.99" -> "17" + "7680.99" -> `177680.99`.
 ///
-/// Deliberately takes the raw `sale_token` string (not the parsed
-/// `sale_number`) so it can pull the last character directly, with no
-/// reformatting/precision loss on the `liters_token` side either — same
-/// reasoning as before for pasting the exact displayed string rather than
-/// reconstructing it from the parsed `liters` float.
+/// A prior version of this function only pasted the counter's last digit,
+/// on the theory that SALE only ever overflows past its own display width
+/// by one unit at a time. That doesn't hold in practice — a real capture
+/// with SALE "0017" (two significant digits) produced a reading missing
+/// its leading "1" once only the last digit ("7") was kept. The display's
+/// two rows are simply the high-order and low-order digits of one number
+/// split across two lines because neither row alone is wide enough to show
+/// it all, so every SALE digit belongs in the result, not just the last
+/// one.
 ///
-/// `sale_number` (the full parsed counter) is untouched by this fix and
-/// still used elsewhere in this file — `sale_number_regression` and the
-/// audit trail/response both need the whole counter value, just not this
-/// concatenation.
-fn compute_reading(liters: Option<f64>, sale_token: &str, liters_token: &str) -> Option<f64> {
+/// Takes the already-parsed `sale_number` (not the raw token) so leading
+/// zeros/whitespace/the "LL" label are stripped the same way as everywhere
+/// else `sale_number` is used (anomaly checks, audit trail, response body)
+/// — one normalization, not a second copy of it. `liters_token` is still
+/// pasted as the raw displayed string, not reconstructed from the parsed
+/// `liters` float, so no decimal precision is lost.
+fn compute_reading(liters: Option<f64>, sale_number: Option<i64>, liters_token: &str) -> Option<f64> {
     liters?;
-    let last_digit = sale_token.trim().chars().last().filter(char::is_ascii_digit)?;
-    format!("{last_digit}{liters_token}").parse::<f64>().ok()
+    let sale_number = sale_number?;
+    format!("{sale_number}{liters_token}").parse::<f64>().ok()
 }
 
 fn liters_decreased(liters: f64, last_liters: f64) -> bool {
@@ -612,7 +611,22 @@ confidence.".to_string();
             // Bounded generously enough that structured-output JSON never
             // gets cut off mid-write; digit-reading is a short, scoped
             // answer, so this is pure headroom, not an expected spend.
-            "maxOutputTokens": 4096
+            "maxOutputTokens": 4096,
+            // Flash-tier Gemini models default to an internal "thinking"
+            // pass (dynamic thinking budget) before writing the actual
+            // response — a real latency cost per call, most of it spent on
+            // reasoning this task doesn't need. Reading two rows of digits
+            // off a photo, against a fixed schema, at temperature 0, is a
+            // single-shot perception task, not a multi-step reasoning one;
+            // the prompt's "reason about each digit's shape" instruction is
+            // satisfied by the model attending to the image carefully while
+            // it writes, not by a separate scratchpad first. Budget 0 turns
+            // thinking off entirely, cutting one full reasoning pass out of
+            // every call's latency with no change to what's actually being
+            // asked of the model. If accuracy on hard/ambiguous photos ever
+            // regresses, raise this to a small positive budget (e.g. 512)
+            // rather than reverting to unbounded dynamic thinking.
+            "thinkingConfig": { "thinkingBudget": 0 }
         }
     });
 
@@ -1035,43 +1049,40 @@ mod tests {
     }
 
     #[test]
-    fn compute_reading_pastes_only_the_last_digit_of_sale_token() {
-        // Spec example: counter "00012", liters "4567.89" -> "24567.89",
-        // NOT "124567.89" (the whole-counter bug this fix replaces).
-        let liters = parse_liters_token("4567.89");
-        assert_eq!(compute_reading(liters, "00012", "4567.89"), Some(24567.89));
+    fn compute_reading_pastes_the_whole_sale_number_not_just_the_last_digit() {
+        // Real-world capture: SALE "0017" (sale_number 17), LITERS
+        // "7680.99" -> "177680.99". Pasting only the last digit ("7")
+        // silently dropped the leading "1" — the bug this fix replaces.
+        let liters = parse_liters_token("7680.99");
+        assert_eq!(compute_reading(liters, Some(17), "7680.99"), Some(177680.99));
     }
 
     #[test]
-    fn compute_reading_multi_digit_counter_uses_last_digit_not_whole_number() {
-        // The old (buggy) whole-integer paste would have produced
-        // 1234567.89 here.
+    fn compute_reading_multi_digit_counter_uses_the_whole_number() {
         let liters = parse_liters_token("4567.89");
-        assert_eq!(compute_reading(liters, "123", "4567.89"), Some(34567.89));
+        assert_eq!(compute_reading(liters, Some(123), "4567.89"), Some(1234567.89));
     }
 
     #[test]
-    fn compute_reading_single_digit_counter_is_unaffected_by_the_fix() {
+    fn compute_reading_single_digit_counter() {
         let liters = parse_liters_token("7530.22");
-        assert_eq!(compute_reading(liters, "0009", "7530.22"), Some(97530.22));
-        assert_eq!(compute_reading(liters, "9", "7530.22"), Some(97530.22));
+        assert_eq!(compute_reading(liters, Some(9), "7530.22"), Some(97530.22));
     }
 
     #[test]
     fn compute_reading_zero_counter() {
         let liters = parse_liters_token("1234.56");
-        assert_eq!(compute_reading(liters, "0", "1234.56"), Some(1234.56));
+        assert_eq!(compute_reading(liters, Some(0), "1234.56"), Some(1234.56));
     }
 
     #[test]
     fn compute_reading_none_when_liters_missing() {
-        assert_eq!(compute_reading(None, "9", ""), None);
+        assert_eq!(compute_reading(None, Some(9), ""), None);
     }
 
     #[test]
-    fn compute_reading_none_when_sale_token_empty_or_unparseable() {
+    fn compute_reading_none_when_sale_number_missing() {
         let liters = parse_liters_token("6252.95");
-        assert_eq!(compute_reading(liters, "", "6252.95"), None);
-        assert_eq!(compute_reading(liters, "abc", "6252.95"), None);
+        assert_eq!(compute_reading(liters, None, "6252.95"), None);
     }
 }
