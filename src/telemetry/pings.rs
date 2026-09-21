@@ -2,15 +2,15 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{ConnectInfo, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, QueryBuilder};
 
 use crate::authentication::guard::require_auth;
 
@@ -131,6 +131,12 @@ pub fn telemetry_route(db: Arc<PgPool>) -> Router {
                 .route("/", get(get_telemetry))
                 .route("/summary", get(get_telemetry_summary))
                 .route("/devices", get(get_device_locations))
+                // Full accountability drill-down: every ping ever recorded,
+                // filterable/paginated (`/log`) and exportable in full
+                // (`/log/export`) — distinct from `GET /` above, which the
+                // shallow Telemetry dashboard uses for its own rollups.
+                .route("/log", get(get_ping_log))
+                .route("/log/export", get(export_ping_log))
                 .route_layer(middleware::from_fn(require_auth)),
         )
         .with_state(db)
@@ -412,6 +418,289 @@ pub async fn get_device_locations(
         Ok(data) => (StatusCode::OK, Json(serde_json::json!({ "data": data }))).into_response(),
         Err(e) => {
             tracing::error!("[TELEMETRY] device location fetch failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Database error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ── Ping Log (full accountability drill-down) ───────────────────────────────
+//
+// Everything below backs the "Ping Log" admin page: the raw `app_pings`
+// table, every row since the very first ping, filterable and exportable.
+// Distinct from `get_telemetry` above (which the shallow dashboard uses) —
+// this is meant to answer "show me exactly what happened" rather than "give
+// me a rollup".
+
+#[derive(Debug, Deserialize)]
+pub struct PingLogQuery {
+    #[serde(default = "default_page")]
+    pub page: i64,
+    #[serde(default = "default_log_page_size")]
+    pub page_size: i64,
+    /// Exact match. Empty string is treated the same as "not set". Most
+    /// callers should pass `company_url` alongside this — `company_prefix`
+    /// alone is ambiguous (many unrelated companies in the directory share
+    /// prefix "0_"); together they match the same `(company_url,
+    /// company_prefix)` pair the `companies` table treats as unique.
+    pub company_prefix: Option<String>,
+    pub company_url: Option<String>,
+    pub device_id: Option<String>,
+    pub user_id: Option<String>,
+    /// Free-text search across device id, user id, model, brand, company
+    /// name/url and IP address.
+    pub q: Option<String>,
+    /// RFC3339 timestamp or bare `YYYY-MM-DD` date (inclusive).
+    pub from: Option<String>,
+    /// RFC3339 timestamp or bare `YYYY-MM-DD` date (inclusive, end-of-day).
+    pub to: Option<String>,
+    #[serde(default = "default_sort")]
+    pub sort: String,
+}
+
+fn default_log_page_size() -> i64 {
+    50
+}
+
+fn default_sort() -> String {
+    "desc".to_string()
+}
+
+fn parse_from_ts(s: &Option<String>) -> Option<DateTime<Utc>> {
+    let v = s.as_deref()?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(v) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    NaiveDate::parse_from_str(v, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+}
+
+fn parse_to_ts(s: &Option<String>) -> Option<DateTime<Utc>> {
+    let v = s.as_deref()?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(v) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    NaiveDate::parse_from_str(v, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
+}
+
+/// Shared WHERE-clause builder for the list, count, and export queries below
+/// — keeps the three query shapes (which must always agree on what "matches
+/// the current filters" means) from drifting apart. Every bound value is
+/// owned (String/DateTime), so it can be handed to `push_bind` without any
+/// lifetime entanglement with `params`.
+fn push_ping_filters(qb: &mut QueryBuilder<'_, sqlx::Postgres>, params: &PingLogQuery) {
+    qb.push(" WHERE 1=1 ");
+
+    if let Some(cp) = params.company_prefix.as_deref().filter(|s| !s.is_empty()) {
+        qb.push(" AND company_prefix = ").push_bind(cp.to_string());
+    }
+    if let Some(cu) = params.company_url.as_deref().filter(|s| !s.is_empty()) {
+        qb.push(" AND company_url = ").push_bind(cu.to_string());
+    }
+    if let Some(d) = params.device_id.as_deref().filter(|s| !s.is_empty()) {
+        qb.push(" AND device_id = ").push_bind(d.to_string());
+    }
+    if let Some(u) = params.user_id.as_deref().filter(|s| !s.is_empty()) {
+        qb.push(" AND user_id = ").push_bind(u.to_string());
+    }
+    if let Some(from) = parse_from_ts(&params.from) {
+        qb.push(" AND pinged_at >= ").push_bind(from);
+    }
+    if let Some(to) = parse_to_ts(&params.to) {
+        qb.push(" AND pinged_at <= ").push_bind(to);
+    }
+    if let Some(q) = params.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let pat = format!("%{q}%");
+        qb.push(" AND (device_id ILIKE ")
+            .push_bind(pat.clone())
+            .push(" OR user_id ILIKE ")
+            .push_bind(pat.clone())
+            .push(" OR model ILIKE ")
+            .push_bind(pat.clone())
+            .push(" OR brand ILIKE ")
+            .push_bind(pat.clone())
+            .push(" OR company_name ILIKE ")
+            .push_bind(pat.clone())
+            .push(" OR company_url ILIKE ")
+            .push_bind(pat.clone())
+            .push(" OR ip_address ILIKE ")
+            .push_bind(pat)
+            .push(")");
+    }
+}
+
+const PING_LOG_COLUMNS: &str = r#"id, company_url, company_prefix, company_name, user_id,
+        app_version, abi, model, brand, android_version,
+        device_id, ip_address, client_timestamp, pinged_at,
+        lat, lon, location_accuracy"#;
+
+/// GET /telemetry/log — paginated, filterable view over the raw `app_pings`
+/// table for the "Ping Log" accountability page. `page_size` is capped at
+/// 500 (same ceiling the shallow dashboard already relies on for its own
+/// fetch) so a careless huge page can't stall the pool.
+pub async fn get_ping_log(
+    State(db): State<Arc<PgPool>>,
+    Query(params): Query<PingLogQuery>,
+) -> impl IntoResponse {
+    let page = params.page.max(1);
+    let page_size = params.page_size.clamp(1, 500);
+    let offset = (page - 1) * page_size;
+    let sort_dir = if params.sort.eq_ignore_ascii_case("asc") {
+        "ASC"
+    } else {
+        "DESC"
+    };
+
+    let mut count_qb = QueryBuilder::new("SELECT COUNT(*) FROM app_pings");
+    push_ping_filters(&mut count_qb, &params);
+    let total: Result<(i64,), _> = count_qb.build_query_as().fetch_one(db.as_ref()).await;
+
+    let mut data_qb = QueryBuilder::new(format!("SELECT {PING_LOG_COLUMNS} FROM app_pings"));
+    push_ping_filters(&mut data_qb, &params);
+    data_qb.push(format!(" ORDER BY pinged_at {sort_dir} LIMIT "));
+    data_qb.push_bind(page_size);
+    data_qb.push(" OFFSET ");
+    data_qb.push_bind(offset);
+
+    let rows = data_qb
+        .build_query_as::<PingRow>()
+        .fetch_all(db.as_ref())
+        .await;
+
+    match (rows, total) {
+        (Ok(data), Ok((total_count,))) => {
+            let total_pages = (total_count as f64 / page_size as f64).ceil() as i64;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "data": data,
+                    "meta": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": total_pages
+                    }
+                })),
+            )
+                .into_response()
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!("[TELEMETRY] ping log fetch error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Database error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Hard ceiling on a single export, independent of anything the client
+/// asks for. This is a safety valve for the (unbounded, unfiltered) worst
+/// case, not a normal operating limit — at real fleet sizes today this
+/// never engages, but `app_pings` only grows, and the whole result set is
+/// built as one CSV string in memory before it's written out.
+const EXPORT_ROW_CAP: i64 = 500_000;
+
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn push_csv_row(out: &mut String, r: &PingRow) {
+    let cols = [
+        r.id.to_string(),
+        r.pinged_at.to_rfc3339(),
+        r.client_timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
+        r.company_name.clone(),
+        r.company_url.clone(),
+        r.company_prefix.clone(),
+        r.device_id.clone(),
+        r.user_id.clone(),
+        r.brand.clone(),
+        r.model.clone(),
+        r.android_version.clone(),
+        r.abi.clone(),
+        r.app_version.clone(),
+        r.ip_address.clone(),
+        r.lat.map(|v| v.to_string()).unwrap_or_default(),
+        r.lon.map(|v| v.to_string()).unwrap_or_default(),
+        r.location_accuracy.map(|v| v.to_string()).unwrap_or_default(),
+    ];
+    out.push_str(&cols.iter().map(|c| csv_field(c)).collect::<Vec<_>>().join(","));
+    out.push('\n');
+}
+
+/// GET /telemetry/log/export — every ping matching the current filters (not
+/// just the current page), as a downloadable CSV. This is the "give
+/// management the whole accountability trail" button: no pagination, same
+/// filters as `/log` so what you filtered to on screen is what you get in
+/// the file.
+pub async fn export_ping_log(
+    State(db): State<Arc<PgPool>>,
+    Query(params): Query<PingLogQuery>,
+) -> impl IntoResponse {
+    let sort_dir = if params.sort.eq_ignore_ascii_case("asc") {
+        "ASC"
+    } else {
+        "DESC"
+    };
+
+    let mut qb = QueryBuilder::new(format!("SELECT {PING_LOG_COLUMNS} FROM app_pings"));
+    push_ping_filters(&mut qb, &params);
+    qb.push(format!(" ORDER BY pinged_at {sort_dir} LIMIT "));
+    qb.push_bind(EXPORT_ROW_CAP);
+
+    let rows = qb.build_query_as::<PingRow>().fetch_all(db.as_ref()).await;
+
+    match rows {
+        Ok(data) => {
+            let mut csv = String::with_capacity(data.len() * 160 + 256);
+            csv.push_str(
+                "id,pinged_at,client_timestamp,company_name,company_url,company_prefix,\
+                 device_id,user_id,brand,model,android_version,abi,app_version,ip_address,\
+                 lat,lon,location_accuracy\n",
+            );
+            for r in &data {
+                push_csv_row(&mut csv, r);
+            }
+
+            let filename = format!(
+                "ping-log-full-export-{}.csv",
+                Utc::now().format("%Y%m%d-%H%M%S")
+            );
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                "text/csv; charset=utf-8".parse().unwrap(),
+            );
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\"").parse().unwrap(),
+            );
+
+            (StatusCode::OK, headers, csv).into_response()
+        }
+        Err(e) => {
+            tracing::error!("[TELEMETRY] ping log export failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Database error" })),
