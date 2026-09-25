@@ -1,0 +1,3 @@
+2026-09-21T13:07:00.820417Z  INFO ThreadId(01) logic: src/main.rs:36: Starting Backup service
+2026-09-21T13:07:03.196192Z  WARN ThreadId(01) sqlx::pool::acquire: /home/mentor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-core-0.8.6/src/pool/inner.rs:302: acquired connection, but time to acquire exceeded slow threshold aquired_after_secs=2.375216228 slow_acquire_threshold_secs=2.0
+2026-09-21T13:07:03.198924Z  INFO ThreadId(01) logic: src/main.rs:106: Server listening on 0.0.0.0:8000

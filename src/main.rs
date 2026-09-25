@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 mod authentication;
+mod bulk_milk_log;
 mod companies;
 mod configuration;
 mod meter_ocr;
@@ -17,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     authentication::{guard::require_auth, login::login_route, signup::signup_route},
+    bulk_milk_log::submissions::bulk_milk_log_route,
     companies::operations::companies_route,
     configuration::operations::version_control,
     meter_ocr::operations::meter_ocr_route,
@@ -82,6 +84,13 @@ println!("Signup mounted at: {}", &signup_path);
         // (see meter_ocr::operations::meter_ocr_route's doc comment for why
         // this one still isn't a free-for-all despite that).
         .nest(&format!("{base_path}/meter-ocr"), meter_ocr_route(db.clone()))
+        // Accountability log for the old_pos "Bulk Milk Purchase" form —
+        // POST is public (old_pos never logs into this Rust API, only into
+        // the separate PHP backend), GET/summary/export are admin-only.
+        .nest(
+            &format!("{base_path}/bulk-milk-log"),
+            bulk_milk_log_route(db.clone()),
+        )
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         // A panicking handler used to kill the connection outright — the

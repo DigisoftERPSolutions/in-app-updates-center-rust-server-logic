@@ -20,7 +20,8 @@ sqlx = { version = "0.8", features = [
     "runtime-tokio-rustls",
     "postgres",
     "uuid",
-    "chrono"
+    "chrono",
+    "json"
 ] }
 tokio      = { version = "1",   features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic"] }
