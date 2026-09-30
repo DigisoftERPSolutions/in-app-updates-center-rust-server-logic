@@ -58,11 +58,9 @@ pub struct PingRow {
     pub location_accuracy: Option<f64>,
 }
 
-/// One row per device — its MOST RECENT ping, for the live device map.
-/// Distinct from `PingRow` (which is one row per ping / a raw history feed)
-/// because the map only cares about "where is this device right now",
-/// never its full ping history.
-#[derive(Serialize, sqlx::FromRow)]
+/// All-time inventory: one row per (company URL, prefix, device ID).
+/// Latest activity and latest valid GPS fix have independent timestamps.
+#[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct DeviceLocationRow {
     pub device_id: String,
     pub company_url: String,
@@ -72,9 +70,16 @@ pub struct DeviceLocationRow {
     pub model: String,
     pub brand: String,
     pub app_version: String,
+    pub android_version: String,
+    pub abi: String,
+    pub ping_count: i64,
+    pub first_ping: DateTime<Utc>,
+    pub users: Vec<String>,
+    pub ip_addresses: Vec<String>,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub location_accuracy: Option<f64>,
+    pub location_pinged_at: Option<DateTime<Utc>>,
     pub pinged_at: DateTime<Utc>,
 }
 
@@ -308,7 +313,7 @@ pub async fn get_telemetry_summary(State(db): State<Arc<PgPool>>) -> impl IntoRe
         SELECT
             COUNT(*)                                                                    AS total_pings,
             COUNT(DISTINCT device_id)                                                   AS distinct_devices,
-            COUNT(DISTINCT company_url)                                                 AS distinct_companies,
+            COUNT(DISTINCT (company_url, company_prefix))                                                 AS distinct_companies,
             COUNT(DISTINCT device_id) FILTER (WHERE pinged_at > NOW() - INTERVAL '24 hours') AS active_24h,
             COUNT(DISTINCT device_id) FILTER (WHERE pinged_at > NOW() - INTERVAL '1 hour')    AS active_1h,
             (
@@ -327,21 +332,21 @@ pub async fn get_telemetry_summary(State(db): State<Arc<PgPool>>) -> impl IntoRe
     let by_company = sqlx::query_as::<_, CompanyBreakdown>(
         r#"
         WITH latest AS (
-            SELECT DISTINCT ON (company_url)
+            SELECT DISTINCT ON (company_url, company_prefix)
                 company_url, company_name, company_prefix,
                 app_version AS latest_version, pinged_at AS last_seen
             FROM app_pings
-            ORDER BY company_url, pinged_at DESC
+            ORDER BY company_url, company_prefix, pinged_at DESC, id DESC
         ),
         counts AS (
-            SELECT company_url, COUNT(DISTINCT device_id) AS device_count
+            SELECT company_url, company_prefix, COUNT(DISTINCT device_id) AS device_count
             FROM app_pings
-            GROUP BY company_url
+            GROUP BY company_url, company_prefix
         )
         SELECT l.company_url, l.company_name, l.company_prefix,
                l.latest_version, l.last_seen, c.device_count
         FROM latest l
-        JOIN counts c ON c.company_url = l.company_url
+        JOIN counts c ON c.company_url = l.company_url AND c.company_prefix = l.company_prefix
         ORDER BY l.last_seen DESC
         "#,
     )
@@ -384,45 +389,39 @@ pub async fn get_telemetry_summary(State(db): State<Arc<PgPool>>) -> impl IntoRe
 
 #[derive(Deserialize)]
 pub struct DeviceLocationQuery {
+    pub company_url: Option<String>,
     pub company_prefix: Option<String>,
+    pub device_id: Option<String>,
 }
 
-/// GET /telemetry/devices — the live device map's data source: one row per
-/// device, its MOST RECENT ping only (`DISTINCT ON`), optionally scoped to a
-/// company. Devices that have never sent a GPS fix are still returned (with
-/// lat/lon null) so the map/list can show "N devices, M with a known
-/// location" rather than silently dropping the rest.
+const DEVICE_INVENTORY_SQL: &str = include_str!("device_inventory.sql");
+
+/// GET /telemetry/devices — all recorded devices, without a date window or
+/// raw-ping page limit. Aggregation happens in Postgres so the browser never
+/// needs to download the entire ping history to compute lifetime totals.
 pub async fn get_device_locations(
     State(db): State<Arc<PgPool>>,
     Query(params): Query<DeviceLocationQuery>,
 ) -> impl IntoResponse {
-    let has_company_filter = params.company_prefix.is_some();
-    let company_prefix = params.company_prefix.unwrap_or_default();
-
-    let rows = sqlx::query_as::<_, DeviceLocationRow>(
-        r#"
-        SELECT DISTINCT ON (device_id)
-            device_id, company_url, company_prefix, company_name, user_id,
-            model, brand, app_version, lat, lon, location_accuracy, pinged_at
-        FROM app_pings
-        WHERE NOT $1 OR company_prefix = $2
-        ORDER BY device_id, pinged_at DESC
-        "#,
-    )
-    .bind(has_company_filter)
-    .bind(&company_prefix)
-    .fetch_all(db.as_ref())
-    .await;
+    let rows = sqlx::query_as::<_, DeviceLocationRow>(DEVICE_INVENTORY_SQL)
+        .bind(params.company_url)
+        .bind(params.company_prefix)
+        .bind(params.device_id)
+        .fetch_all(db.as_ref())
+        .await;
 
     match rows {
-        Ok(data) => (StatusCode::OK, Json(serde_json::json!({ "data": data }))).into_response(),
+        Ok(data) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "private, no-store")],
+            Json(serde_json::json!({ "data": data })),
+        ).into_response(),
         Err(e) => {
-            tracing::error!("[TELEMETRY] device location fetch failed: {e}");
+            tracing::error!("[TELEMETRY] device inventory fetch failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Database error" })),
-            )
-                .into_response()
+            ).into_response()
         }
     }
 }
@@ -707,5 +706,72 @@ pub async fn export_ping_log(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    // Use a disposable local database. A session-local table shadows app_pings;
+    // no production data or permanent tables are touched.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL pointing at a disposable Postgres database"]
+    async fn all_time_inventory_retains_old_devices_and_latest_gps() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let pool = PgPool::connect(&url).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE app_pings (
+                id BIGSERIAL PRIMARY KEY, company_url TEXT NOT NULL,
+                company_prefix TEXT NOT NULL, company_name TEXT NOT NULL,
+                device_id TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT 'user',
+                model TEXT NOT NULL DEFAULT 'model', brand TEXT NOT NULL DEFAULT 'brand',
+                app_version TEXT NOT NULL DEFAULT '1', android_version TEXT NOT NULL DEFAULT '14',
+                abi TEXT NOT NULL DEFAULT 'arm64-v8a', ip_address TEXT NOT NULL DEFAULT '127.0.0.1',
+                lat DOUBLE PRECISION, lon DOUBLE PRECISION, location_accuracy DOUBLE PRECISION,
+                pinged_at TIMESTAMPTZ NOT NULL
+            );
+            INSERT INTO app_pings (company_url, company_prefix, company_name, device_id, pinged_at, lat, lon)
+            VALUES
+                ('https://a.test/', '0_', 'Same name', 'old-only', '2020-01-01', NULL, NULL),
+                ('https://a.test/', '0_', 'Old company name', 'shared', '2021-01-01', -1.2, 36.8),
+                ('https://a.test/', '0_', 'Same name', 'shared', '2022-01-01', -1.3, 36.9),
+                ('https://b.test/', '0_', 'Same name', 'shared', '2023-01-01', 1.0, 37.0),
+                ('https://a.test/', '1_', 'Same name', 'shared', '2023-02-01', 2.0, 38.0);
+            INSERT INTO app_pings (company_url, company_prefix, company_name, device_id, pinged_at)
+            SELECT 'https://a.test/', '0_', 'Same name', 'shared', '2026-01-01'::timestamptz + n * interval '1 minute'
+            FROM generate_series(1, 600) AS n;
+            -- Deterministic tie-break: latest id supplies metadata. Invalid GPS
+            -- never replaces the valid 2022 fix.
+            INSERT INTO app_pings (company_url, company_prefix, company_name, device_id, pinged_at, app_version, lat, lon)
+            VALUES ('https://a.test/', '0_', 'Renamed company', 'shared', '2026-01-01 10:00:00+00', 'latest', 999, 999);"
+        ).execute(&mut *connection).await.unwrap();
+        let all = sqlx::query_as::<_, DeviceLocationRow>(DEVICE_INVENTORY_SQL)
+            .bind(None::<String>).bind(None::<String>).bind(None::<String>)
+            .fetch_all(&mut *connection).await.unwrap();
+        assert_eq!(all.len(), 4); // Includes the old device outside the latest 500 pings.
+        let main = all.iter().find(|r| r.company_url == "https://a.test/" && r.company_prefix == "0_" && r.device_id == "shared").unwrap();
+        assert_eq!(main.ping_count, 603);
+        assert_eq!(main.first_ping.to_rfc3339(), "2021-01-01T00:00:00+00:00");
+        assert_eq!(main.pinged_at.to_rfc3339(), "2026-01-01T10:00:00+00:00");
+        assert_eq!(main.app_version, "latest");
+        assert_eq!(main.company_name, "Renamed company");
+        assert_eq!(main.lat, Some(-1.3));
+        assert_eq!(main.lon, Some(36.9));
+        assert_eq!(main.location_pinged_at.unwrap().to_rfc3339(), "2022-01-01T00:00:00+00:00");
+        let old = all.iter().find(|r| r.device_id == "old-only").unwrap();
+        assert_eq!(old.ping_count, 1);
+        assert!(old.lat.is_none() && old.location_pinged_at.is_none());
+        let exact = sqlx::query_as::<_, DeviceLocationRow>(DEVICE_INVENTORY_SQL)
+            .bind("https://a.test/").bind("1_").bind("shared")
+            .fetch_all(&mut *connection).await.unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].ping_count, 1);
+        assert_eq!(exact[0].lat, Some(2.0));
+        let empty = sqlx::query_as::<_, DeviceLocationRow>(DEVICE_INVENTORY_SQL)
+            .bind("https://missing.test/").bind(None::<String>).bind(None::<String>)
+            .fetch_all(&mut *connection).await.unwrap();
+        assert!(empty.is_empty());
     }
 }

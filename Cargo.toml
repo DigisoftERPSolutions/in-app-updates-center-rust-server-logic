@@ -31,3 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bcrypt     = "0.16"     # for password hashing
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4.45", features = ["clock","serde"] }
+
+sha2 = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod apk_library;
 mod authentication;
 mod bulk_milk_log;
 mod companies;
@@ -72,6 +73,7 @@ println!("Signup mounted at: {}", &signup_path);
     // already live on real devices, so those two stay public while every
     // admin mutation/view on the same routers stays behind `require_auth`.
     let app = Router::new()
+        .nest(&format!("{base_path}/apk-releases"), apk_library::routes())
         .nest(&format!("{base_path}/signup"), signup_route(db.clone()))
         .nest(&format!("{base_path}/login"), login_route(db.clone()))
         .nest(&format!("{base_path}/configure"), version_control(db.clone()))
